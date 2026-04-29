@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "x-bookmark-scraper"
+version = "0.1.0"
+description = "Local X bookmark scraping, pipeline, UI, and viewer tools."
+readme = "scrape/README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "playwright>=1.52.0",
+]
+
+[project.optional-dependencies]
+video = [
+  "yt-dlp>=2025.3.31",
+]
+
+[project.scripts]
+x-bookmarks-scrape = "scrape.x_bookmarks_scrape:main"
+x-bookmarks-pipeline = "scrape.x_bookmarks_pipeline:main"
+x-bookmarks-ui = "scrape.x_bookmarks_ui:main"
+x-bookmarks-viewer = "scrape.x_bookmarks_viewer:main"
+
+[tool.setuptools]
+packages = ["scrape"]

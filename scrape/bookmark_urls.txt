@@ -1,0 +1,9 @@
+# One X bookmarks URL per line.
+# The main bookmarks page can be included as:
+# https://x.com/i/bookmarks
+https://x.com/i/bookmarks/1800448182712680484
+https://x.com/i/bookmarks/1975105062687920140
+https://x.com/i/bookmarks/1954420182912205020
+https://x.com/i/bookmarks/1860793550902038871
+https://x.com/i/bookmarks/1819981332555932036
+https://x.com/i/bookmarks

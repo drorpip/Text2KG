@@ -1,0 +1,17 @@
+# Local virtual environments and temp work dirs
+.venv/
+.venv_broken_20260424/
+.tmp/
+.tmp2/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+
+# Generated scraper outputs and downloaded media
+scrape/x_bookmarks_output/
+
+# Local browser profiles and session data used for scraping
+scrape/playwright_x_profile/
+scrape/chrome_x_profile/
+scrape/edge_x_profile_9222/
