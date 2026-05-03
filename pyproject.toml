@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "x-bookmark-scraper"
 version = "0.1.0"
 description = "Local X bookmark scraping, pipeline, UI, and viewer tools."
-readme = "scrape/README.md"
+readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
   "playwright>=1.52.0",
