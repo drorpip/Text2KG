@@ -1,4 +1,4 @@
-import type { KnowledgeGraph } from "./types";
+import type { GeneralizationLevel, KgResult } from "./types";
 
 export type ApiLogEntry = {
   id: string;
@@ -9,40 +9,59 @@ export type ApiLogEntry = {
 
 type LogSink = (entry: ApiLogEntry) => void;
 
-export async function suggestGraph(text: string, graph: KnowledgeGraph, log?: LogSink): Promise<KnowledgeGraph> {
-  return postGraph("/api/graph/suggest", { text, graph }, log);
-}
-
-export async function expandGraph(selection: unknown, graph: KnowledgeGraph, log?: LogSink): Promise<KnowledgeGraph> {
-  return postGraph("/api/graph/expand", { selection, graph }, log);
-}
-
-async function postGraph(path: string, body: unknown, log?: LogSink): Promise<KnowledgeGraph> {
+export async function analyzeText(
+  text: string,
+  generalizationLevel: GeneralizationLevel,
+  log?: LogSink
+): Promise<KgResult> {
   const startedAt = performance.now();
-  log?.(makeLog("info", `POST ${path} started (${summarizeBody(body)})`));
+  log?.(makeLog("info", `POST /api/kg/analyze started (${text.length} chars, ${generalizationLevel})`));
 
-  const response = await fetch(path, {
+  const response = await fetch("/api/kg/analyze", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body)
+    body: JSON.stringify({ text, generalizationLevel })
   });
 
   const payload = await response.json();
   const elapsedMs = Math.round(performance.now() - startedAt);
 
   if (!response.ok) {
-    log?.(makeLog("error", `POST ${path} failed ${response.status} after ${elapsedMs}ms: ${payload.error ?? "unknown error"}`));
-    throw new Error(payload.error ?? "Graph request failed.");
+    log?.(makeLog("error", `Analysis failed ${response.status} after ${elapsedMs}ms: ${payload.error ?? "unknown error"}`));
+    throw new Error(payload.error ?? "KG analysis failed.");
   }
 
   log?.(
     makeLog(
       "info",
-      `POST ${path} succeeded after ${elapsedMs}ms (${payload.nodes?.length ?? 0} nodes, ${payload.edges?.length ?? 0} edges)`
+      `Analysis succeeded after ${elapsedMs}ms (${payload.triples?.length ?? 0} triples, ${payload.nodes?.length ?? 0} nodes)`
     )
   );
 
   return payload;
+}
+
+export async function exportGraphMl(kg: KgResult, approvedOnly: boolean, log?: LogSink): Promise<string> {
+  const startedAt = performance.now();
+  log?.(makeLog("info", `POST /api/kg/export/graphml started (${approvedOnly ? "approved only" : "reviewed graph"})`));
+
+  const response = await fetch("/api/kg/export/graphml", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ kg, approvedOnly })
+  });
+
+  const elapsedMs = Math.round(performance.now() - startedAt);
+
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({ error: "GraphML export failed." }));
+    log?.(makeLog("error", `GraphML export failed ${response.status} after ${elapsedMs}ms: ${payload.error}`));
+    throw new Error(payload.error ?? "GraphML export failed.");
+  }
+
+  const graphml = await response.text();
+  log?.(makeLog("info", `GraphML export succeeded after ${elapsedMs}ms (${graphml.length} chars)`));
+  return graphml;
 }
 
 export function makeLog(level: ApiLogEntry["level"], message: string): ApiLogEntry {
@@ -52,24 +71,4 @@ export function makeLog(level: ApiLogEntry["level"], message: string): ApiLogEnt
     level,
     message
   };
-}
-
-function summarizeBody(body: unknown): string {
-  if (!body || typeof body !== "object") {
-    return "empty";
-  }
-
-  const value = body as { text?: string; graph?: KnowledgeGraph; selection?: unknown };
-  const parts: string[] = [];
-  if (typeof value.text === "string") {
-    parts.push(`${value.text.length} text chars`);
-  }
-  if (value.graph) {
-    parts.push(`${value.graph.nodes.length} nodes/${value.graph.edges.length} edges`);
-  }
-  if (value.selection) {
-    parts.push("selection included");
-  }
-
-  return parts.join(", ") || "graph request";
 }

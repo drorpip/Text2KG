@@ -1,741 +1,527 @@
-import { ChangeEvent, useEffect, useMemo, useRef, useState } from "react";
-import ReactFlow, {
-  Background,
-  Connection,
-  Controls,
-  Edge,
-  MiniMap,
-  Node,
-  OnEdgesChange,
-  OnNodesChange,
-  addEdge,
-  applyEdgeChanges,
-  applyNodeChanges,
-  useReactFlow
-} from "reactflow";
+import { useEffect, useMemo, useState } from "react";
 import {
+  Check,
   Download,
-  FileUp,
-  GitBranchPlus,
-  Plus,
-  Save,
-  Sparkles,
-  Terminal,
+  FileText,
+  Pencil,
+  RefreshCcw,
+  TableProperties,
   Trash2,
-  Wand2
+  X,
+  XCircle
 } from "lucide-react";
-import { ApiLogEntry, expandGraph, makeLog, suggestGraph } from "./api";
-import { emptyGraph, mergeGraphs, toFlowEdges, toFlowNodes, uniqueId } from "./graph";
-import type { GraphNodeType, KnowledgeEdge, KnowledgeGraph, KnowledgeNode, Suggestion } from "./types";
+import { ApiLogEntry, analyzeText, exportGraphMl, makeLog } from "./api";
+import { confidenceLabel, emptyKgResult, filenameFromText, reviewedTriples, statusLabel } from "./graph";
+import type { GeneralizationLevel, KgResult, KgTriple, ReviewStatus } from "./types";
 
-const storageKey = "knowledge-graph-tool-state-v1";
-const topicsStorageKey = "knowledge-graph-tool-topics-v1";
-const nodeTypes: GraphNodeType[] = ["concept", "tool", "entity", "process", "source", "unknown"];
+const storageKey = "text2kg-state-v1";
 
 type SavedState = {
-  currentTopicId?: string;
-  topicName: string;
   sourceText: string;
-  graph: KnowledgeGraph;
-  suggestions: Suggestion[];
+  generalizationLevel: GeneralizationLevel;
+  kg: KgResult;
 };
 
-type SavedTopic = SavedState & {
-  id: string;
-  updatedAt: number;
-};
+type ActiveView = "triples" | "nodes" | "edges" | "schema";
 
 export function App() {
   const initialState = loadState();
-  const [currentTopicId, setCurrentTopicId] = useState(initialState.currentTopicId);
-  const [topicName, setTopicName] = useState(initialState.topicName);
-  const [savedTopics, setSavedTopics] = useState<SavedTopic[]>(() => loadTopics());
   const [sourceText, setSourceText] = useState(initialState.sourceText);
-  const [graph, setGraph] = useState<KnowledgeGraph>(initialState.graph);
-  const [flowNodes, setFlowNodes] = useState<Node[]>(() => toFlowNodes(initialState.graph.nodes));
-  const [flowEdges, setFlowEdges] = useState<Edge[]>(() => toFlowEdges(initialState.graph.edges));
-  const [suggestions, setSuggestions] = useState<Suggestion[]>(initialState.suggestions);
-  const [selected, setSelected] = useState<{ type: "node" | "edge"; id: string } | null>(null);
+  const [generalizationLevel, setGeneralizationLevel] = useState<GeneralizationLevel>(initialState.generalizationLevel);
+  const [kg, setKg] = useState<KgResult>(initialState.kg);
+  const [activeView, setActiveView] = useState<ActiveView>("triples");
+  const [editingTripleId, setEditingTripleId] = useState<string | null>(null);
   const [status, setStatus] = useState("Ready");
+  const [error, setError] = useState("");
   const [isLoading, setIsLoading] = useState(false);
+  const [approvedOnlyExport, setApprovedOnlyExport] = useState(false);
   const [logs, setLogs] = useState<ApiLogEntry[]>(() => [
-    makeLog("info", "Diagnostics ready. Server logs are also printed in the dev terminal.")
+    makeLog("info", "Text2KG diagnostics ready. Backend logs are printed in the dev terminal.")
   ]);
-  const importRef = useRef<HTMLInputElement | null>(null);
-  const reactFlow = useReactFlow();
 
   function addLog(entry: ApiLogEntry) {
     setLogs((items) => [entry, ...items].slice(0, 80));
   }
 
   useEffect(() => {
-    localStorage.setItem(storageKey, JSON.stringify({ currentTopicId, topicName, sourceText, graph, suggestions }));
-  }, [currentTopicId, topicName, sourceText, graph, suggestions]);
+    localStorage.setItem(storageKey, JSON.stringify({ sourceText, generalizationLevel, kg }));
+  }, [sourceText, generalizationLevel, kg]);
 
-  useEffect(() => {
-    localStorage.setItem(topicsStorageKey, JSON.stringify(savedTopics));
-  }, [savedTopics]);
-
-  useEffect(() => {
-    setFlowNodes((current) => {
-      const byId = new Map(current.map((node) => [node.id, node]));
-      return toFlowNodes(graph.nodes).map((node) => ({
-        ...node,
-        position: byId.get(node.id)?.position ?? node.position,
-        selected: selected?.type === "node" && selected.id === node.id
-      }));
-    });
-    setFlowEdges(
-      toFlowEdges(graph.edges).map((edge) => ({
-        ...edge,
-        selected: selected?.type === "edge" && selected.id === edge.id
-      }))
-    );
-  }, [graph, selected]);
-
-  const selectedNode = selected?.type === "node" ? graph.nodes.find((node) => node.id === selected.id) : undefined;
-  const selectedEdge = selected?.type === "edge" ? graph.edges.find((edge) => edge.id === selected.id) : undefined;
-
-  const graphStats = useMemo(
-    () => `${graph.nodes.length} nodes / ${graph.edges.length} edges`,
-    [graph.nodes.length, graph.edges.length]
-  );
-
-  const onNodesChange: OnNodesChange = (changes) => setFlowNodes((nodes) => applyNodeChanges(changes, nodes));
-  const onEdgesChange: OnEdgesChange = (changes) => setFlowEdges((edges) => applyEdgeChanges(changes, edges));
-
-  function syncNodePositions(nodes: Node[]) {
-    setFlowNodes(nodes);
-  }
-
-  function onConnect(connection: Connection) {
-    if (!connection.source || !connection.target || connection.source === connection.target) {
-      return;
-    }
-
-    const id = uniqueId(`${connection.source}-relates-to-${connection.target}`, new Set(graph.edges.map((edge) => edge.id)));
-    const edge: KnowledgeEdge = {
-      id,
-      source: connection.source,
-      target: connection.target,
-      label: "relates to"
+  const stats = useMemo(() => {
+    const lowConfidence = kg.triples.filter((triple) => triple.confidence < 0.55 || triple.status === "needs_review").length;
+    return {
+      nodes: kg.nodes.length,
+      edges: kg.edges.length,
+      triples: kg.triples.length,
+      lowConfidence,
+      reviewed: kg.triples.filter((triple) => triple.status === "approved" || triple.status === "rejected").length,
+      exportable: reviewedTriples(kg.triples).length
     };
+  }, [kg]);
 
-    setGraph((current) => ({ ...current, edges: [...current.edges, edge] }));
-    setFlowEdges((edges) => addEdge({ ...edge, label: edge.label }, edges));
-    setSelected({ type: "edge", id });
-  }
-
-  async function requestSuggestions() {
+  async function requestAnalysis() {
     setIsLoading(true);
-    setStatus("Asking Ollama for graph suggestions...");
-    addLog(makeLog("info", `Suggest graph clicked with ${sourceText.length} source chars and ${graph.nodes.length} existing nodes.`));
+    setError("");
+    setStatus("Analyzing text with local Ollama...");
+    addLog(makeLog("info", `Analyze clicked with ${sourceText.length} source chars.`));
+
     try {
-      const result = await suggestGraph(sourceText, graph, addLog);
-      setSuggestions((items) => [{ ...result, createdAt: Date.now() }, ...items]);
-      setStatus(`Received ${result.nodes.length} node and ${result.edges.length} edge suggestions.`);
-      addLog(makeLog("info", `Suggestion queued: ${result.nodes.length} nodes, ${result.edges.length} edges.`));
-    } catch (error) {
-      setStatus(error instanceof Error ? error.message : "Suggestion request failed.");
-      addLog(makeLog("error", error instanceof Error ? error.message : "Suggestion request failed."));
+      const result = await analyzeText(sourceText, generalizationLevel, addLog);
+      setKg(result);
+      setActiveView("triples");
+      setEditingTripleId(null);
+      setStatus(`Detected ${result.triples.length} suggested triples from ${result.nodes.length} possible nodes.`);
+    } catch (caught) {
+      const message = caught instanceof Error ? caught.message : "Analysis failed.";
+      setError(message);
+      setStatus(message);
+      addLog(makeLog("error", message));
     } finally {
       setIsLoading(false);
     }
   }
 
-  async function requestExpansion() {
-    setIsLoading(true);
-    setStatus("Asking Ollama for expansion ideas...");
-    addLog(makeLog("info", `Expand clicked with ${selected ? `${selected.type}:${selected.id}` : "whole graph"} selected.`));
-    try {
-      const selection =
-        selectedNode ?? selectedEdge ?? { focus: "whole graph", sourceText: sourceText.slice(0, 2000) };
-      const result = await expandGraph(selection, graph, addLog);
-      setSuggestions((items) => [{ ...result, createdAt: Date.now() }, ...items]);
-      setStatus(`Received ${result.nodes.length} expansion nodes and ${result.edges.length} edges.`);
-      addLog(makeLog("info", `Expansion queued: ${result.nodes.length} nodes, ${result.edges.length} edges.`));
-    } catch (error) {
-      setStatus(error instanceof Error ? error.message : "Expansion request failed.");
-      addLog(makeLog("error", error instanceof Error ? error.message : "Expansion request failed."));
-    } finally {
-      setIsLoading(false);
-    }
-  }
-
-  function acceptSuggestion(index: number) {
-    const suggestion = suggestions[index];
-    setGraph((current) => mergeGraphs(current, suggestion));
-    setSuggestions((items) => items.filter((_, itemIndex) => itemIndex !== index));
-    setStatus("Suggestion merged into the working graph.");
-    addLog(makeLog("info", `Accepted proposal with ${suggestion.nodes.length} nodes and ${suggestion.edges.length} edges.`));
-    window.requestAnimationFrame(() => reactFlow.fitView({ padding: 0.2, duration: 300 }));
-  }
-
-  function rejectSuggestion(index: number) {
-    const suggestion = suggestions[index];
-    setSuggestions((items) => items.filter((_, itemIndex) => itemIndex !== index));
-    addLog(makeLog("info", `Rejected proposal with ${suggestion.nodes.length} nodes and ${suggestion.edges.length} edges.`));
-  }
-
-  function addNode() {
-    const usedIds = new Set(graph.nodes.map((node) => node.id));
-    const id = uniqueId("new-concept", usedIds);
-    const node: KnowledgeNode = { id, label: "New concept", type: "concept" };
-    setGraph((current) => ({ ...current, nodes: [...current.nodes, node] }));
-    setSelected({ type: "node", id });
-    addLog(makeLog("info", `Added node ${id}.`));
-  }
-
-  function saveTopic() {
-    const now = Date.now();
-    const name = topicName.trim() || inferTopicName(sourceText) || "Untitled topic";
-    const id = currentTopicId ?? `topic-${now}`;
-    const topic: SavedTopic = {
-      id,
-      updatedAt: now,
-      currentTopicId: id,
-      topicName: name,
-      sourceText,
-      graph,
-      suggestions
-    };
-
-    setCurrentTopicId(id);
-    setTopicName(name);
-    setSavedTopics((topics) => [topic, ...topics.filter((item) => item.id !== id)].sort((a, b) => b.updatedAt - a.updatedAt));
-    setStatus(`Saved "${name}".`);
-    addLog(makeLog("info", `Saved topic ${name} with ${graph.nodes.length} nodes and ${graph.edges.length} edges.`));
-  }
-
-  function startNewTopic() {
-    setCurrentTopicId(undefined);
-    setTopicName("Untitled topic");
-    setSourceText("");
-    setGraph(emptyGraph);
-    setSuggestions([]);
-    setSelected(null);
-    setStatus("Started a new topic.");
-    addLog(makeLog("info", "Started a new topic workspace."));
-  }
-
-  function loadTopic(topicId: string) {
-    const topic = savedTopics.find((item) => item.id === topicId);
-    if (!topic) {
-      return;
-    }
-
-    setCurrentTopicId(topic.id);
-    setTopicName(topic.topicName);
-    setSourceText(topic.sourceText);
-    setGraph(topic.graph);
-    setSuggestions(topic.suggestions);
-    setSelected(null);
-    setStatus(`Loaded "${topic.topicName}".`);
-    addLog(makeLog("info", `Loaded topic ${topic.topicName}.`));
-    window.requestAnimationFrame(() => reactFlow.fitView({ padding: 0.2, duration: 300 }));
-  }
-
-  function deleteTopic(topicId: string) {
-    const topic = savedTopics.find((item) => item.id === topicId);
-    if (!topic) {
-      return;
-    }
-
-    const shouldDelete = window.confirm(`Delete saved topic "${topic.topicName}"? This only removes the local saved copy.`);
-    if (!shouldDelete) {
-      return;
-    }
-
-    setSavedTopics((topics) => topics.filter((item) => item.id !== topicId));
-    if (currentTopicId === topicId) {
-      startNewTopic();
-    }
-    setStatus(`Deleted "${topic.topicName}".`);
-    addLog(makeLog("info", `Deleted saved topic ${topic.topicName}.`));
-  }
-
-  function deleteSelected() {
-    if (!selected) {
-      return;
-    }
-
-    if (selected.type === "node") {
-      setGraph((current) => ({
-        ...current,
-        nodes: current.nodes.filter((node) => node.id !== selected.id),
-        edges: current.edges.filter((edge) => edge.source !== selected.id && edge.target !== selected.id)
-      }));
-    } else {
-      setGraph((current) => ({
-        ...current,
-        edges: current.edges.filter((edge) => edge.id !== selected.id)
-      }));
-    }
-
-    setSelected(null);
-    addLog(makeLog("info", `Deleted selected ${selected.type} ${selected.id}.`));
-  }
-
-  function updateNode(id: string, patch: Partial<KnowledgeNode>) {
-    setGraph((current) => ({
+  function updateTriple(id: string, patch: Partial<KgTriple>) {
+    setKg((current) => ({
       ...current,
-      nodes: current.nodes.map((node) => (node.id === id ? { ...node, ...patch } : node))
-    }));
-  }
-
-  function updateEdge(id: string, patch: Partial<KnowledgeEdge>) {
-    setGraph((current) => ({
-      ...current,
-      edges: current.edges.map((edge) => (edge.id === id ? { ...edge, ...patch } : edge))
-    }));
-  }
-
-  function mergeNodeIntoTarget(sourceId: string, targetId: string) {
-    if (!sourceId || !targetId || sourceId === targetId) {
-      return;
-    }
-
-    setGraph((current) => ({
-      ...current,
-      nodes: current.nodes.filter((node) => node.id !== sourceId),
-      edges: dedupeEdges(
-        current.edges
-          .filter((edge) => edge.id !== sourceId)
-          .map((edge) => ({
-            ...edge,
-            source: edge.source === sourceId ? targetId : edge.source,
-            target: edge.target === sourceId ? targetId : edge.target
-          }))
-          .filter((edge) => edge.source !== edge.target)
+      triples: current.triples.map((triple) =>
+        triple.id === id ? { ...triple, ...patch, status: patch.status ?? "edited" } : triple
       )
     }));
-    setSelected({ type: "node", id: targetId });
-    addLog(makeLog("info", `Merged node ${sourceId} into ${targetId}.`));
   }
 
-  function exportGraph() {
-    const blob = new Blob([JSON.stringify({ sourceText, graph }, null, 2)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = "knowledge-graph.json";
-    link.click();
-    URL.revokeObjectURL(url);
-    addLog(makeLog("info", `Exported graph with ${graph.nodes.length} nodes and ${graph.edges.length} edges.`));
+  function setTripleStatus(id: string, nextStatus: ReviewStatus) {
+    setKg((current) => ({
+      ...current,
+      triples: current.triples.map((triple) => (triple.id === id ? { ...triple, status: nextStatus } : triple))
+    }));
   }
 
-  function importGraph(event: ChangeEvent<HTMLInputElement>) {
-    const file = event.target.files?.[0];
-    if (!file) {
-      return;
+  function deleteTriple(id: string) {
+    setKg((current) => ({
+      ...current,
+      triples: current.triples.map((triple) => (triple.id === id ? { ...triple, status: "rejected" } : triple))
+    }));
+    setEditingTripleId(null);
+  }
+
+  function resetWorkspace() {
+    setSourceText("");
+    setGeneralizationLevel("medium");
+    setKg(emptyKgResult);
+    setEditingTripleId(null);
+    setError("");
+    setStatus("Ready");
+    addLog(makeLog("info", "Workspace cleared."));
+  }
+
+  async function downloadGraphMl() {
+    setIsLoading(true);
+    setError("");
+    try {
+      const graphml = await exportGraphMl(kg, approvedOnlyExport, addLog);
+      const blob = new Blob([graphml], { type: "application/graphml+xml" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = filenameFromText(sourceText);
+      link.click();
+      URL.revokeObjectURL(url);
+      setStatus(`Exported ${approvedOnlyExport ? "approved" : "reviewed"} graph as GraphML.`);
+    } catch (caught) {
+      const message = caught instanceof Error ? caught.message : "GraphML export failed.";
+      setError(message);
+      setStatus(message);
+    } finally {
+      setIsLoading(false);
     }
-
-    const reader = new FileReader();
-    reader.onload = () => {
-      try {
-        const parsed = JSON.parse(String(reader.result));
-        const nextGraph = parsed.graph ?? parsed;
-        if (!Array.isArray(nextGraph.nodes) || !Array.isArray(nextGraph.edges)) {
-          throw new Error("Imported file does not contain graph nodes and edges.");
-        }
-        setGraph(nextGraph);
-        setSourceText(typeof parsed.sourceText === "string" ? parsed.sourceText : sourceText);
-        setSuggestions([]);
-        setSelected(null);
-        setStatus("Graph imported.");
-        addLog(makeLog("info", `Imported graph with ${nextGraph.nodes.length} nodes and ${nextGraph.edges.length} edges.`));
-      } catch (error) {
-        setStatus(error instanceof Error ? error.message : "Could not import graph.");
-        addLog(makeLog("error", error instanceof Error ? error.message : "Could not import graph."));
-      } finally {
-        event.target.value = "";
-      }
-    };
-    reader.readAsText(file);
   }
 
   return (
     <div className="app-shell">
       <header className="top-bar">
         <div>
-          <h1>Knowledge Graph Workspace</h1>
-          <p>{graphStats}</p>
+          <h1>Text2KG</h1>
+          <p>Knowledge Graph Understanding Assistant</p>
         </div>
-        <div className="toolbar">
-          <button type="button" onClick={addNode} title="Add node">
-            <Plus size={18} />
+        <div className="top-actions">
+          <button type="button" className="secondary-button" onClick={resetWorkspace} title="Clear workspace">
+            <RefreshCcw size={17} />
+            Reset
           </button>
-          <button type="button" onClick={deleteSelected} disabled={!selected} title="Delete selected">
-            <Trash2 size={18} />
+          <button type="button" onClick={downloadGraphMl} disabled={isLoading || stats.exportable === 0} title="Export GraphML">
+            <Download size={17} />
+            Export GraphML
           </button>
-          <button type="button" onClick={() => importRef.current?.click()} title="Import JSON">
-            <FileUp size={18} />
-          </button>
-          <button type="button" onClick={exportGraph} title="Export JSON">
-            <Download size={18} />
-          </button>
-          <input ref={importRef} type="file" accept="application/json" hidden onChange={importGraph} />
         </div>
       </header>
 
       <main className="workspace">
-        <section className="source-panel">
-          <TopicManager
-            topicName={topicName}
-            currentTopicId={currentTopicId}
-            savedTopics={savedTopics}
-            onTopicNameChange={setTopicName}
-            onSave={saveTopic}
-            onNew={startNewTopic}
-            onLoad={loadTopic}
-            onDelete={deleteTopic}
-          />
+        <section className="input-panel">
+          <div className="panel-heading">
+            <FileText size={18} />
+            <div>
+              <h2>Source Text</h2>
+              <p>Paste a long English article or business document.</p>
+            </div>
+          </div>
+
           <textarea
             value={sourceText}
             onChange={(event) => setSourceText(event.target.value)}
-            placeholder="Paste source text here..."
+            placeholder="Paste a long English text. Text2KG will suggest triples, evidence, confidence, and useful types."
           />
-          <div className="source-actions">
-            <button type="button" onClick={requestSuggestions} disabled={isLoading || !sourceText.trim()}>
-              <Sparkles size={17} />
-              Suggest graph
-            </button>
-            <button type="button" onClick={requestExpansion} disabled={isLoading || graph.nodes.length === 0}>
-              <Wand2 size={17} />
-              Expand
-            </button>
+
+          <label className="field">
+            Generalization level
+            <select
+              value={generalizationLevel}
+              onChange={(event) => setGeneralizationLevel(event.target.value as GeneralizationLevel)}
+            >
+              <option value="low">Low - specific instance facts</option>
+              <option value="medium">Medium - typed entities</option>
+              <option value="high">High - schema suggestions</option>
+            </select>
+          </label>
+
+          <button type="button" className="analyze-button" onClick={requestAnalysis} disabled={isLoading}>
+            <TableProperties size={18} />
+            {isLoading ? "Analyzing..." : "Analyze"}
+          </button>
+
+          <p className={error ? "status error" : "status"}>{status}</p>
+          {error ? <p className="error-box">{error}</p> : null}
+        </section>
+
+        <section className="results-panel">
+          <Summary stats={stats} notes={kg.notes} />
+
+          <div className="tabs" role="tablist" aria-label="KG result views">
+            <TabButton active={activeView === "triples"} onClick={() => setActiveView("triples")}>
+              Suggested triples
+            </TabButton>
+            <TabButton active={activeView === "nodes"} onClick={() => setActiveView("nodes")}>
+              Possible nodes
+            </TabButton>
+            <TabButton active={activeView === "edges"} onClick={() => setActiveView("edges")}>
+              Potential relationships
+            </TabButton>
+            <TabButton active={activeView === "schema"} onClick={() => setActiveView("schema")}>
+              Schema view
+            </TabButton>
           </div>
-          <p className="status">{status}</p>
+
+          <div className="result-surface">
+            {activeView === "triples" ? (
+              <TriplesTable
+                triples={kg.triples}
+                editingTripleId={editingTripleId}
+                onEdit={setEditingTripleId}
+                onUpdate={updateTriple}
+                onStatus={setTripleStatus}
+                onDelete={deleteTriple}
+              />
+            ) : null}
+            {activeView === "nodes" ? <NodesList kg={kg} /> : null}
+            {activeView === "edges" ? <EdgesList kg={kg} /> : null}
+            {activeView === "schema" ? <SchemaView kg={kg} /> : null}
+          </div>
         </section>
 
-        <section className="canvas-panel">
-          <ReactFlow
-            nodes={flowNodes}
-            edges={flowEdges}
-            onNodesChange={onNodesChange}
-            onEdgesChange={onEdgesChange}
-            onNodesDelete={() => syncNodePositions(flowNodes)}
-            onNodeDragStop={(_, __, nodes) => syncNodePositions(nodes)}
-            onConnect={onConnect}
-            onNodeClick={(_, node) => setSelected({ type: "node", id: node.id })}
-            onEdgeClick={(_, edge) => setSelected({ type: "edge", id: edge.id })}
-            onPaneClick={() => setSelected(null)}
-            fitView
-          >
-            <Background gap={18} size={1} color="#d7dee8" />
-            <Controls />
-            <MiniMap pannable zoomable nodeStrokeWidth={3} />
-          </ReactFlow>
-        </section>
+        <aside className="review-panel">
+          <section className="panel-block">
+            <h2>Export</h2>
+            <label className="checkbox-row">
+              <input
+                type="checkbox"
+                checked={approvedOnlyExport}
+                onChange={(event) => setApprovedOnlyExport(event.target.checked)}
+              />
+              Approved triples only
+            </label>
+            <p className="muted">
+              {approvedOnlyExport
+                ? `${kg.triples.filter((triple) => triple.status === "approved").length} approved triples ready.`
+                : `${stats.exportable} non-rejected triples ready.`}
+            </p>
+          </section>
 
-        <aside className="inspector">
-          <Inspector
-            graph={graph}
-            selectedNode={selectedNode}
-            selectedEdge={selectedEdge}
-            onUpdateNode={updateNode}
-            onUpdateEdge={updateEdge}
-            onMergeNode={mergeNodeIntoTarget}
-          />
-          <SuggestionQueue suggestions={suggestions} onAccept={acceptSuggestion} onReject={rejectSuggestion} />
-          <Diagnostics logs={logs} onClear={() => setLogs([makeLog("info", "Diagnostics cleared.")])} />
+          <section className="panel-block diagnostics-block">
+            <div className="panel-title-row">
+              <h2>Diagnostics</h2>
+              <button type="button" className="secondary-button compact" onClick={() => setLogs([makeLog("info", "Diagnostics cleared.")])}>
+                Clear
+              </button>
+            </div>
+            <div className="log-list" aria-live="polite">
+              {logs.map((entry) => (
+                <div className={`log-entry ${entry.level}`} key={entry.id}>
+                  <time>{entry.time}</time>
+                  <span>{entry.message}</span>
+                </div>
+              ))}
+            </div>
+          </section>
         </aside>
       </main>
     </div>
   );
 }
 
-function Diagnostics({ logs, onClear }: { logs: ApiLogEntry[]; onClear: () => void }) {
+function Summary({
+  stats,
+  notes
+}: {
+  stats: { nodes: number; edges: number; triples: number; lowConfidence: number; reviewed: number; exportable: number };
+  notes: string;
+}) {
   return (
-    <section className="panel-block diagnostics-block">
-      <div className="panel-title-row">
-        <h2>
-          <Terminal size={16} />
-          Diagnostics
-        </h2>
-        <button type="button" onClick={onClear}>
-          Clear
-        </button>
-      </div>
-      <div className="log-list" aria-live="polite">
-        {logs.map((entry) => (
-          <div className={`log-entry ${entry.level}`} key={entry.id}>
-            <time>{entry.time}</time>
-            <span>{entry.message}</span>
-          </div>
-        ))}
-      </div>
+    <section className="summary-band">
+      <StatCard label="Possible nodes" value={stats.nodes} />
+      <StatCard label="Potential edges" value={stats.edges} />
+      <StatCard label="Suggested triples" value={stats.triples} />
+      <StatCard label="Needs review" value={stats.lowConfidence} tone={stats.lowConfidence ? "warn" : "normal"} />
+      <StatCard label="Reviewed" value={stats.reviewed} />
+      {notes ? <p className="notes">{notes}</p> : null}
     </section>
   );
 }
 
-function TopicManager({
-  topicName,
-  currentTopicId,
-  savedTopics,
-  onTopicNameChange,
-  onSave,
-  onNew,
-  onLoad,
+function StatCard({ label, value, tone = "normal" }: { label: string; value: number; tone?: "normal" | "warn" }) {
+  return (
+    <div className={`stat-card ${tone}`}>
+      <strong>{value}</strong>
+      <span>{label}</span>
+    </div>
+  );
+}
+
+function TabButton({ active, children, onClick }: { active: boolean; children: string; onClick: () => void }) {
+  return (
+    <button type="button" className={active ? "tab active" : "tab"} onClick={onClick}>
+      {children}
+    </button>
+  );
+}
+
+function TriplesTable({
+  triples,
+  editingTripleId,
+  onEdit,
+  onUpdate,
+  onStatus,
   onDelete
 }: {
-  topicName: string;
-  currentTopicId?: string;
-  savedTopics: SavedTopic[];
-  onTopicNameChange: (value: string) => void;
-  onSave: () => void;
-  onNew: () => void;
-  onLoad: (topicId: string) => void;
-  onDelete: (topicId: string) => void;
+  triples: KgTriple[];
+  editingTripleId: string | null;
+  onEdit: (id: string | null) => void;
+  onUpdate: (id: string, patch: Partial<KgTriple>) => void;
+  onStatus: (id: string, status: ReviewStatus) => void;
+  onDelete: (id: string) => void;
 }) {
-  return (
-    <section className="topic-manager">
-      <label>
-        Topic
-        <input value={topicName} onChange={(event) => onTopicNameChange(event.target.value)} placeholder="Name this exploration" />
-      </label>
-      <div className="topic-actions">
-        <button type="button" onClick={onSave}>
-          <Save size={16} />
-          Save
-        </button>
-        <button type="button" onClick={onNew}>
-          <Plus size={16} />
-          New
-        </button>
-      </div>
-      <div className="saved-topic-list">
-        {savedTopics.length === 0 ? (
-          <p className="muted">No saved topics yet.</p>
-        ) : (
-          savedTopics.map((topic) => (
-            <article className={topic.id === currentTopicId ? "saved-topic active" : "saved-topic"} key={topic.id}>
-              <button type="button" className="saved-topic-main" onClick={() => onLoad(topic.id)}>
-                <strong>{topic.topicName}</strong>
-                <span>
-                  {topic.graph.nodes.length} nodes / {topic.graph.edges.length} edges
-                </span>
-              </button>
-              <button type="button" className="saved-topic-delete" onClick={() => onDelete(topic.id)} title="Delete saved topic">
-                <Trash2 size={15} />
-              </button>
-            </article>
-          ))
-        )}
-      </div>
-    </section>
-  );
-}
-
-function Inspector({
-  graph,
-  selectedNode,
-  selectedEdge,
-  onUpdateNode,
-  onUpdateEdge,
-  onMergeNode
-}: {
-  graph: KnowledgeGraph;
-  selectedNode?: KnowledgeNode;
-  selectedEdge?: KnowledgeEdge;
-  onUpdateNode: (id: string, patch: Partial<KnowledgeNode>) => void;
-  onUpdateEdge: (id: string, patch: Partial<KnowledgeEdge>) => void;
-  onMergeNode: (sourceId: string, targetId: string) => void;
-}) {
-  if (selectedNode) {
-    return (
-      <section className="panel-block">
-        <h2>Node</h2>
-        <label>
-          Label
-          <input value={selectedNode.label} onChange={(event) => onUpdateNode(selectedNode.id, { label: event.target.value })} />
-        </label>
-        <label>
-          Type
-          <select
-            value={selectedNode.type}
-            onChange={(event) => onUpdateNode(selectedNode.id, { type: event.target.value as GraphNodeType })}
-          >
-            {nodeTypes.map((type) => (
-              <option key={type} value={type}>
-                {type}
-              </option>
-            ))}
-          </select>
-        </label>
-        <label>
-          Description
-          <textarea
-            value={selectedNode.description ?? ""}
-            onChange={(event) => onUpdateNode(selectedNode.id, { description: event.target.value })}
-          />
-        </label>
-        <label>
-          Source
-          <input value={selectedNode.source ?? ""} onChange={(event) => onUpdateNode(selectedNode.id, { source: event.target.value })} />
-        </label>
-        <label>
-          Merge into
-          <select defaultValue="" onChange={(event) => onMergeNode(selectedNode.id, event.target.value)}>
-            <option value="" disabled>
-              Select target
-            </option>
-            {graph.nodes
-              .filter((node) => node.id !== selectedNode.id)
-              .map((node) => (
-                <option key={node.id} value={node.id}>
-                  {node.label}
-                </option>
-              ))}
-          </select>
-        </label>
-      </section>
-    );
-  }
-
-  if (selectedEdge) {
-    return (
-      <section className="panel-block">
-        <h2>Relationship</h2>
-        <label>
-          Label
-          <input value={selectedEdge.label} onChange={(event) => onUpdateEdge(selectedEdge.id, { label: event.target.value })} />
-        </label>
-        <label>
-          Source
-          <select value={selectedEdge.source} onChange={(event) => onUpdateEdge(selectedEdge.id, { source: event.target.value })}>
-            {graph.nodes.map((node) => (
-              <option key={node.id} value={node.id}>
-                {node.label}
-              </option>
-            ))}
-          </select>
-        </label>
-        <label>
-          Target
-          <select value={selectedEdge.target} onChange={(event) => onUpdateEdge(selectedEdge.id, { target: event.target.value })}>
-            {graph.nodes.map((node) => (
-              <option key={node.id} value={node.id}>
-                {node.label}
-              </option>
-            ))}
-          </select>
-        </label>
-        <label>
-          Description
-          <textarea
-            value={selectedEdge.description ?? ""}
-            onChange={(event) => onUpdateEdge(selectedEdge.id, { description: event.target.value })}
-          />
-        </label>
-      </section>
-    );
+  if (triples.length === 0) {
+    return <EmptyState title="No suggested triples yet" body="Analyze a text to see reviewable Knowledge Graph suggestions." />;
   }
 
   return (
-    <section className="panel-block empty-selection">
-      <GitBranchPlus size={28} />
-      <h2>No selection</h2>
-      <p>Select a node or relationship to edit its hypothesis details.</p>
-    </section>
+    <div className="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Subject</th>
+            <th>Predicate</th>
+            <th>Object</th>
+            <th>Types</th>
+            <th>Confidence</th>
+            <th>Evidence</th>
+            <th>Status</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {triples.map((triple) => {
+            const isEditing = editingTripleId === triple.id;
+            return (
+              <tr key={triple.id} className={`status-${triple.status}`}>
+                <td>
+                  {isEditing ? (
+                    <input value={triple.subject} onChange={(event) => onUpdate(triple.id, { subject: event.target.value })} />
+                  ) : (
+                    triple.subject
+                  )}
+                </td>
+                <td>
+                  {isEditing ? (
+                    <input value={triple.predicate} onChange={(event) => onUpdate(triple.id, { predicate: event.target.value })} />
+                  ) : (
+                    <strong>{triple.predicate}</strong>
+                  )}
+                </td>
+                <td>
+                  {isEditing ? (
+                    <input value={triple.object} onChange={(event) => onUpdate(triple.id, { object: event.target.value })} />
+                  ) : (
+                    triple.object
+                  )}
+                </td>
+                <td>
+                  {isEditing ? (
+                    <div className="type-edit">
+                      <input
+                        value={triple.subject_type}
+                        aria-label="Subject type"
+                        onChange={(event) => onUpdate(triple.id, { subject_type: event.target.value })}
+                      />
+                      <input
+                        value={triple.object_type}
+                        aria-label="Object type"
+                        onChange={(event) => onUpdate(triple.id, { object_type: event.target.value })}
+                      />
+                    </div>
+                  ) : (
+                    <span className="type-pair">
+                      {triple.subject_type} {"->"} {triple.object_type}
+                    </span>
+                  )}
+                </td>
+                <td>
+                  <span className={`confidence ${confidenceClass(triple.confidence)}`}>
+                    {triple.confidence.toFixed(2)}
+                    <small>{confidenceLabel(triple.confidence)}</small>
+                  </span>
+                </td>
+                <td>
+                  <blockquote>{triple.evidence || "No clear evidence"}</blockquote>
+                </td>
+                <td>
+                  <span className={`status-pill ${triple.status}`}>{statusLabel(triple.status)}</span>
+                </td>
+                <td>
+                  <div className="action-row">
+                    <button type="button" className="icon-button approve" onClick={() => onStatus(triple.id, "approved")} title="Approve">
+                      <Check size={16} />
+                    </button>
+                    <button type="button" className="icon-button reject" onClick={() => onStatus(triple.id, "rejected")} title="Reject">
+                      <X size={16} />
+                    </button>
+                    <button
+                      type="button"
+                      className="icon-button"
+                      onClick={() => onEdit(isEditing ? null : triple.id)}
+                      title={isEditing ? "Finish editing" : "Edit"}
+                    >
+                      <Pencil size={16} />
+                    </button>
+                    <button type="button" className="icon-button reject" onClick={() => onDelete(triple.id)} title="Delete triple">
+                      <Trash2 size={16} />
+                    </button>
+                  </div>
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
   );
 }
 
-function SuggestionQueue({
-  suggestions,
-  onAccept,
-  onReject
-}: {
-  suggestions: Suggestion[];
-  onAccept: (index: number) => void;
-  onReject: (index: number) => void;
-}) {
+function NodesList({ kg }: { kg: KgResult }) {
+  if (kg.nodes.length === 0) {
+    return <EmptyState title="No possible nodes yet" body="Nodes are derived from the suggested triples and model output." />;
+  }
+
   return (
-    <section className="panel-block suggestion-block">
-      <h2>AI proposals</h2>
-      {suggestions.length === 0 ? (
-        <p className="muted">No pending proposals.</p>
-      ) : (
-        suggestions.map((suggestion, index) => (
-          <article className="suggestion" key={`${suggestion.createdAt}-${index}`}>
-            <strong>
-              {suggestion.nodes.length} nodes, {suggestion.edges.length} edges
-            </strong>
-            {suggestion.notes ? <p>{suggestion.notes}</p> : null}
-            <div className="suggestion-preview">
-              {suggestion.nodes.slice(0, 5).map((node) => (
-                <span key={node.id}>{node.label}</span>
-              ))}
-            </div>
-            <div className="proposal-actions">
-              <button type="button" onClick={() => onAccept(index)}>
-                Accept
-              </button>
-              <button type="button" onClick={() => onReject(index)}>
-                Reject
-              </button>
-            </div>
-          </article>
-        ))
-      )}
-    </section>
+    <div className="card-grid">
+      {kg.nodes.map((node) => (
+        <article className="info-card" key={node.id}>
+          <div className="card-title-row">
+            <h3>{node.name}</h3>
+            <span className="type-chip">{node.label}</span>
+          </div>
+          <p>{confidenceLabel(node.confidence)} · {node.confidence.toFixed(2)}</p>
+          {node.evidence.length ? <blockquote>{node.evidence[0]}</blockquote> : null}
+        </article>
+      ))}
+    </div>
   );
+}
+
+function EdgesList({ kg }: { kg: KgResult }) {
+  const nodeById = new Map(kg.nodes.map((node) => [node.id, node.name]));
+  if (kg.edges.length === 0) {
+    return <EmptyState title="No potential relationships yet" body="Relationships are created from accepted model triples." />;
+  }
+
+  return (
+    <div className="card-grid">
+      {kg.edges.map((edge) => (
+        <article className="info-card" key={edge.id}>
+          <h3>{nodeById.get(edge.source) ?? edge.source}</h3>
+          <p>
+            <strong>{edge.label}</strong> {"->"} {nodeById.get(edge.target) ?? edge.target}
+          </p>
+          <p>{confidenceLabel(edge.confidence)} · {edge.confidence.toFixed(2)}</p>
+          {edge.evidence.length ? <blockquote>{edge.evidence[0]}</blockquote> : null}
+        </article>
+      ))}
+    </div>
+  );
+}
+
+function SchemaView({ kg }: { kg: KgResult }) {
+  if (kg.schema.length === 0) {
+    return <EmptyState title="No schema suggestions yet" body="Use medium or high generalization to request reusable KG patterns." />;
+  }
+
+  return (
+    <div className="schema-list">
+      {kg.schema.map((schema) => (
+        <article className="schema-row" key={schema.id}>
+          <span>{schema.subject_type}</span>
+          <strong>{schema.predicate}</strong>
+          <span>{schema.object_type}</span>
+          <em>{schema.confidence.toFixed(2)}</em>
+        </article>
+      ))}
+    </div>
+  );
+}
+
+function EmptyState({ title, body }: { title: string; body: string }) {
+  return (
+    <div className="empty-state">
+      <XCircle size={28} />
+      <h3>{title}</h3>
+      <p>{body}</p>
+    </div>
+  );
+}
+
+function confidenceClass(confidence: number): string {
+  if (confidence >= 0.8) {
+    return "high";
+  }
+  if (confidence >= 0.55) {
+    return "medium";
+  }
+  return "low";
 }
 
 function loadState(): SavedState {
   try {
     const raw = localStorage.getItem(storageKey);
     if (!raw) {
-      return { topicName: "Untitled topic", sourceText: "", graph: emptyGraph, suggestions: [] };
+      return { sourceText: "", generalizationLevel: "medium", kg: emptyKgResult };
     }
 
     const parsed = JSON.parse(raw) as Partial<SavedState>;
     return {
-      currentTopicId: parsed.currentTopicId,
-      topicName: parsed.topicName ?? "Untitled topic",
       sourceText: parsed.sourceText ?? "",
-      graph: parsed.graph?.nodes && parsed.graph?.edges ? parsed.graph : emptyGraph,
-      suggestions: Array.isArray(parsed.suggestions) ? parsed.suggestions : []
+      generalizationLevel: parsed.generalizationLevel ?? "medium",
+      kg: parsed.kg?.triples && parsed.kg?.nodes && parsed.kg?.edges ? parsed.kg : emptyKgResult
     };
   } catch {
-    return { topicName: "Untitled topic", sourceText: "", graph: emptyGraph, suggestions: [] };
+    return { sourceText: "", generalizationLevel: "medium", kg: emptyKgResult };
   }
-}
-
-function loadTopics(): SavedTopic[] {
-  try {
-    const raw = localStorage.getItem(topicsStorageKey);
-    if (!raw) {
-      return [];
-    }
-
-    const parsed = JSON.parse(raw) as SavedTopic[];
-    return Array.isArray(parsed)
-      ? parsed
-          .filter((topic) => topic.id && topic.topicName && topic.graph?.nodes && topic.graph?.edges)
-          .sort((a, b) => b.updatedAt - a.updatedAt)
-      : [];
-  } catch {
-    return [];
-  }
-}
-
-function inferTopicName(text: string): string {
-  return text
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .find(Boolean)
-    ?.slice(0, 48) ?? "";
-}
-
-function dedupeEdges(edges: KnowledgeEdge[]): KnowledgeEdge[] {
-  const seen = new Set<string>();
-  return edges.filter((edge) => {
-    const key = `${edge.source}:${edge.target}:${edge.label.toLowerCase()}`;
-    if (seen.has(key)) {
-      return false;
-    }
-    seen.add(key);
-    return true;
-  });
 }
