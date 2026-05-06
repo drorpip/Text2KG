@@ -11,23 +11,28 @@ import {
   XCircle
 } from "lucide-react";
 import { ApiLogEntry, analyzeText, exportGraphMl, makeLog } from "./api";
+import { GraphEditor, type GraphLayout } from "./GraphEditor";
 import { confidenceLabel, emptyKgResult, filenameFromText, reviewedTriples, statusLabel } from "./graph";
-import type { GeneralizationLevel, KgResult, KgTriple, ReviewStatus } from "./types";
+import type { GeneralizationLevel, KgResult, KgTriple, ModelProvider, ReviewStatus } from "./types";
 
 const storageKey = "text2kg-state-v1";
 
 type SavedState = {
   sourceText: string;
   generalizationLevel: GeneralizationLevel;
+  modelProvider: ModelProvider;
+  graphLayout: GraphLayout;
   kg: KgResult;
 };
 
-type ActiveView = "triples" | "nodes" | "edges" | "schema";
+type ActiveView = "graph" | "triples" | "nodes" | "edges" | "schema";
 
 export function App() {
   const initialState = loadState();
   const [sourceText, setSourceText] = useState(initialState.sourceText);
   const [generalizationLevel, setGeneralizationLevel] = useState<GeneralizationLevel>(initialState.generalizationLevel);
+  const [modelProvider, setModelProvider] = useState<ModelProvider>(initialState.modelProvider);
+  const [graphLayout, setGraphLayout] = useState<GraphLayout>(initialState.graphLayout);
   const [kg, setKg] = useState<KgResult>(initialState.kg);
   const [activeView, setActiveView] = useState<ActiveView>("triples");
   const [editingTripleId, setEditingTripleId] = useState<string | null>(null);
@@ -44,8 +49,8 @@ export function App() {
   }
 
   useEffect(() => {
-    localStorage.setItem(storageKey, JSON.stringify({ sourceText, generalizationLevel, kg }));
-  }, [sourceText, generalizationLevel, kg]);
+    localStorage.setItem(storageKey, JSON.stringify({ sourceText, generalizationLevel, modelProvider, graphLayout, kg }));
+  }, [sourceText, generalizationLevel, modelProvider, graphLayout, kg]);
 
   const stats = useMemo(() => {
     const lowConfidence = kg.triples.filter((triple) => triple.confidence < 0.55 || triple.status === "needs_review").length;
@@ -62,12 +67,13 @@ export function App() {
   async function requestAnalysis() {
     setIsLoading(true);
     setError("");
-    setStatus("Analyzing text with local Ollama...");
-    addLog(makeLog("info", `Analyze clicked with ${sourceText.length} source chars.`));
+    setStatus(`Analyzing text with ${modelProviderLabel(modelProvider)}...`);
+    addLog(makeLog("info", `Analyze clicked with ${sourceText.length} source chars using ${modelProviderLabel(modelProvider)}.`));
 
     try {
-      const result = await analyzeText(sourceText, generalizationLevel, addLog);
+      const result = await analyzeText(sourceText, generalizationLevel, modelProvider, addLog);
       setKg(result);
+      setGraphLayout({});
       setActiveView("triples");
       setEditingTripleId(null);
       setStatus(`Detected ${result.triples.length} suggested triples from ${result.nodes.length} possible nodes.`);
@@ -108,6 +114,8 @@ export function App() {
   function resetWorkspace() {
     setSourceText("");
     setGeneralizationLevel("medium");
+    setModelProvider("ollama");
+    setGraphLayout({});
     setKg(emptyKgResult);
     setEditingTripleId(null);
     setError("");
@@ -184,6 +192,14 @@ export function App() {
             </select>
           </label>
 
+          <label className="field">
+            Model
+            <select value={modelProvider} onChange={(event) => setModelProvider(event.target.value as ModelProvider)}>
+              <option value="ollama">Ollama - Gemma</option>
+              <option value="azure-openai">Azure OpenAI - GPT-5.2</option>
+            </select>
+          </label>
+
           <button type="button" className="analyze-button" onClick={requestAnalysis} disabled={isLoading}>
             <TableProperties size={18} />
             {isLoading ? "Analyzing..." : "Analyze"}
@@ -197,6 +213,9 @@ export function App() {
           <Summary stats={stats} notes={kg.notes} />
 
           <div className="tabs" role="tablist" aria-label="KG result views">
+            <TabButton active={activeView === "graph"} onClick={() => setActiveView("graph")}>
+              Graph
+            </TabButton>
             <TabButton active={activeView === "triples"} onClick={() => setActiveView("triples")}>
               Suggested triples
             </TabButton>
@@ -212,6 +231,24 @@ export function App() {
           </div>
 
           <div className="result-surface">
+            {activeView === "graph" ? (
+              <GraphEditor
+                kg={kg}
+                layout={graphLayout}
+                onLayoutChange={setGraphLayout}
+                onKgChange={setKg}
+                onImport={(importedKg) => {
+                  setKg(importedKg);
+                  setGraphLayout({});
+                  setActiveView("graph");
+                  addLog(makeLog("info", `Imported GraphML (${importedKg.nodes.length} nodes, ${importedKg.edges.length} edges).`));
+                }}
+                onStatus={(message) => {
+                  setStatus(message);
+                  addLog(makeLog(message.toLowerCase().includes("failed") || message.toLowerCase().includes("invalid") ? "error" : "info", message));
+                }}
+              />
+            ) : null}
             {activeView === "triples" ? (
               <TriplesTable
                 triples={kg.triples}
@@ -508,20 +545,26 @@ function confidenceClass(confidence: number): string {
   return "low";
 }
 
+function modelProviderLabel(provider: ModelProvider): string {
+  return provider === "azure-openai" ? "Azure OpenAI GPT-5.2" : "local Ollama Gemma";
+}
+
 function loadState(): SavedState {
   try {
     const raw = localStorage.getItem(storageKey);
     if (!raw) {
-      return { sourceText: "", generalizationLevel: "medium", kg: emptyKgResult };
+      return { sourceText: "", generalizationLevel: "medium", modelProvider: "ollama", graphLayout: {}, kg: emptyKgResult };
     }
 
     const parsed = JSON.parse(raw) as Partial<SavedState>;
     return {
       sourceText: parsed.sourceText ?? "",
       generalizationLevel: parsed.generalizationLevel ?? "medium",
+      modelProvider: parsed.modelProvider === "azure-openai" ? "azure-openai" : "ollama",
+      graphLayout: parsed.graphLayout && typeof parsed.graphLayout === "object" ? parsed.graphLayout : {},
       kg: parsed.kg?.triples && parsed.kg?.nodes && parsed.kg?.edges ? parsed.kg : emptyKgResult
     };
   } catch {
-    return { sourceText: "", generalizationLevel: "medium", kg: emptyKgResult };
+    return { sourceText: "", generalizationLevel: "medium", modelProvider: "ollama", graphLayout: {}, kg: emptyKgResult };
   }
 }

@@ -44,6 +44,7 @@ Included in Phase 1:
 - Basic approve, reject, edit, and delete actions
 - GraphML export
 - Local LLM execution through Ollama
+- Optional Azure OpenAI execution through a selectable UI model provider
 
 Out of scope for Phase 1:
 
@@ -55,9 +56,11 @@ Out of scope for Phase 1:
 - External ontology integration
 - Complex graph editing
 
-## Local LLM Configuration
+## Model Configuration
 
-Phase 1 uses a local Ollama model for Knowledge Graph extraction.
+Phase 1 can use either a local Ollama model or Azure OpenAI for Knowledge Graph extraction. Select the provider in the Source Text panel before clicking Analyze.
+
+### Ollama
 
 The system expects Ollama to be running locally at:
 
@@ -86,6 +89,19 @@ OLLAMA_KG_MODEL=gemma4:e4b
 OLLAMA_GENERATE_TIMEOUT_SEC=180
 OLLAMA_BASE_URL=http://127.0.0.1:11434
 ```
+
+### Azure OpenAI
+
+The Azure OpenAI option expects these values in `.env` or the server process environment:
+
+```text
+OPENAI_AZURE_API_KEY=your-api-key
+OPENAI_AZURE_API_ENDPOINT=https://your-resource.openai.azure.com
+OPENAI_AZURE_GPT52_MODEL=your-gpt-5.2-deployment
+OPENAI_AZURE_GPT52_MODEL_VERSION=2025-03-01-preview
+```
+
+`OPENAI_AZURE_GPT52_MODEL` defaults to `gpt-5`. `OPENAI_AZURE_GPT52_MODEL_VERSION` is used as the Azure API version and defaults to `2025-03-01-preview`. The older `OPENAI_AZURE_DEPLOYMENT` and `OPENAI_AZURE_API_VERSION` names are also supported.
 
 ## Supported Input
 
@@ -175,7 +191,7 @@ By default, export includes all non-rejected triples. The UI also supports expor
 - Precision over recall: fewer accurate triples are better than many noisy triples.
 - Human-in-the-loop: the user remains in control.
 - Graph thinking: the product helps users understand structure, not only extract facts.
-- Local first: Phase 1 uses Ollama rather than an external LLM API.
+- Local first by default: Phase 1 uses Ollama unless Azure OpenAI is selected.
 
 ## Requirements
 

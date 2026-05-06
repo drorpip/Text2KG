@@ -1,5 +1,7 @@
 export type GeneralizationLevel = "low" | "medium" | "high";
 
+export type ModelProvider = "ollama" | "azure-openai";
+
 export type ReviewStatus = "pending" | "approved" | "rejected" | "edited" | "needs_review";
 
 export type KgNode = {

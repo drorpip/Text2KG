@@ -141,7 +141,7 @@ blockquote {
   border-right: 1px solid #d7dee8;
   display: grid;
   gap: 13px;
-  grid-template-rows: auto minmax(280px, 1fr) auto auto auto auto;
+  grid-template-rows: auto minmax(280px, 1fr) auto auto auto auto auto;
 }
 
 .input-panel textarea {
@@ -295,6 +295,98 @@ blockquote {
   min-height: 0;
   overflow: auto;
   padding: 14px;
+}
+
+.graph-editor {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: minmax(0, 1fr) 260px;
+  grid-template-rows: auto minmax(520px, 1fr);
+  min-height: 100%;
+}
+
+.graph-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  grid-column: 1 / -1;
+}
+
+.hidden-file-input {
+  display: none;
+}
+
+.graph-canvas {
+  background: #ffffff;
+  border: 1px solid #d7dee8;
+  border-radius: 8px;
+  min-height: 520px;
+  overflow: hidden;
+}
+
+.graph-empty {
+  min-height: 520px;
+}
+
+.graph-details {
+  align-content: start;
+  display: grid;
+  gap: 10px;
+}
+
+.graph-detail-card {
+  background: #ffffff;
+  border: 1px solid #d7dee8;
+  border-radius: 8px;
+  display: grid;
+  gap: 12px;
+  padding: 13px;
+}
+
+.graph-detail-card h3,
+.graph-detail-card p {
+  margin: 0;
+}
+
+.kg-flow-node {
+  background: #ffffff;
+  border: 1px solid #94a3b8;
+  border-radius: 8px;
+  color: #172033;
+  font-size: 12px;
+  line-height: 1.25;
+  min-width: 132px;
+  padding: 9px 10px;
+  text-align: center;
+  white-space: pre-line;
+}
+
+.kg-flow-node.status-needs_review {
+  border-color: #f59e0b;
+}
+
+.kg-flow-node.status-approved {
+  border-color: #22c55e;
+}
+
+.kg-flow-node.status-rejected {
+  border-color: #ef4444;
+}
+
+.react-flow__edge.kg-flow-edge.status-needs_review .react-flow__edge-path {
+  stroke: #f59e0b;
+}
+
+.react-flow__edge.kg-flow-edge.status-approved .react-flow__edge-path {
+  stroke: #16a34a;
+}
+
+.react-flow__edge.kg-flow-edge.status-rejected .react-flow__edge-path {
+  stroke: #dc2626;
+}
+
+.react-flow__edge-text {
+  font-size: 11px;
 }
 
 .table-wrap {
@@ -557,6 +649,10 @@ blockquote {
 
   .results-panel {
     min-height: 720px;
+  }
+
+  .graph-editor {
+    grid-template-columns: 1fr;
   }
 }
 

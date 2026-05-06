@@ -1,4 +1,4 @@
-import type { GeneralizationLevel, KgResult } from "./types";
+import type { GeneralizationLevel, KgResult, ModelProvider } from "./types";
 
 export type ApiLogEntry = {
   id: string;
@@ -12,15 +12,16 @@ type LogSink = (entry: ApiLogEntry) => void;
 export async function analyzeText(
   text: string,
   generalizationLevel: GeneralizationLevel,
+  modelProvider: ModelProvider,
   log?: LogSink
 ): Promise<KgResult> {
   const startedAt = performance.now();
-  log?.(makeLog("info", `POST /api/kg/analyze started (${text.length} chars, ${generalizationLevel})`));
+  log?.(makeLog("info", `POST /api/kg/analyze started (${text.length} chars, ${generalizationLevel}, ${modelProvider})`));
 
   const response = await fetch("/api/kg/analyze", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ text, generalizationLevel })
+    body: JSON.stringify({ text, generalizationLevel, modelProvider })
   });
 
   const payload = await response.json();

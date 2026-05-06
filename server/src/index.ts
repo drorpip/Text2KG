@@ -1,7 +1,10 @@
 import cors from "cors";
 import express from "express";
+import { existsSync, readFileSync } from "node:fs";
+import path from "node:path";
 
 type GeneralizationLevel = "low" | "medium" | "high";
+type ModelProvider = "ollama" | "azure-openai";
 type ReviewStatus = "pending" | "approved" | "rejected" | "edited" | "needs_review";
 
 type KgNode = {
@@ -65,9 +68,15 @@ type RawKgPayload = Partial<{
 }>;
 
 const app = express();
+loadDotEnv();
 const port = Number(process.env.PORT ?? 5174);
 const ollamaBaseUrl = process.env.OLLAMA_BASE_URL ?? process.env.OLLAMA_HOST ?? "http://127.0.0.1:11434";
 const ollamaModel = process.env.OLLAMA_KG_MODEL ?? process.env.OLLAMA_MEDIA_TITLE_MODEL ?? "gemma4:e4b";
+const azureOpenAiApiKey = process.env.OPENAI_AZURE_API_KEY;
+const azureOpenAiEndpoint = process.env.OPENAI_AZURE_API_ENDPOINT;
+const azureOpenAiDeployment = process.env.OPENAI_AZURE_GPT52_MODEL ?? process.env.OPENAI_AZURE_DEPLOYMENT ?? "gpt-5";
+const azureOpenAiApiVersion =
+  process.env.OPENAI_AZURE_API_VERSION ?? process.env.OPENAI_AZURE_GPT52_MODEL_VERSION ?? "2025-03-01-preview";
 const timeoutMs = Number(process.env.OLLAMA_GENERATE_TIMEOUT_SEC ?? 180) * 1000;
 const minMeaningfulTextChars = 80;
 let requestCounter = 0;
@@ -93,14 +102,30 @@ app.use((req, res, next) => {
 });
 
 app.get("/api/health", (_req, res) => {
-  res.json({ ok: true, ollamaBaseUrl, ollamaModel, timeoutSec: timeoutMs / 1000 });
+  res.json({
+    ok: true,
+    providers: {
+      ollama: { baseUrl: ollamaBaseUrl, model: ollamaModel },
+      azureOpenAi: {
+        configured: Boolean(azureOpenAiApiKey && azureOpenAiEndpoint),
+        deployment: azureOpenAiDeployment,
+        apiVersion: azureOpenAiApiVersion
+      }
+    },
+    timeoutSec: timeoutMs / 1000
+  });
 });
 
 app.post("/api/kg/analyze", async (req, res) => {
   try {
-    const { text, generalizationLevel } = req.body as { text?: string; generalizationLevel?: GeneralizationLevel };
+    const { text, generalizationLevel, modelProvider } = req.body as {
+      text?: string;
+      generalizationLevel?: GeneralizationLevel;
+      modelProvider?: ModelProvider;
+    };
     const sourceText = typeof text === "string" ? text.trim() : "";
     const level = normalizeGeneralizationLevel(generalizationLevel);
+    const provider = normalizeModelProvider(modelProvider);
     const requestId = getRequestId(res);
 
     if (!sourceText) {
@@ -113,10 +138,10 @@ app.post("/api/kg/analyze", async (req, res) => {
     }
 
     console.log(
-      `[${new Date().toISOString()}] ${requestId} analyze textChars=${sourceText.length} generalization=${level}`
+      `[${new Date().toISOString()}] ${requestId} analyze textChars=${sourceText.length} generalization=${level} provider=${provider}`
     );
 
-    const raw = await askOllama(buildKgPrompt(sourceText, level), requestId);
+    const raw = await askModel(buildKgPrompt(sourceText, level), provider, requestId);
     const payload = normalizeKgPayload(raw, sourceText, level);
     console.log(
       `[${new Date().toISOString()}] ${requestId} analyze result triples=${payload.triples.length} nodes=${payload.nodes.length} edges=${payload.edges.length} schema=${payload.schema.length}`
@@ -215,6 +240,10 @@ function kgJsonContract(): string {
 }`;
 }
 
+async function askModel(prompt: string, provider: ModelProvider, requestId: string): Promise<RawKgPayload> {
+  return provider === "azure-openai" ? askAzureOpenAi(prompt, requestId) : askOllama(prompt, requestId);
+}
+
 async function askOllama(prompt: string, requestId: string): Promise<RawKgPayload> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -251,7 +280,7 @@ async function askOllama(prompt: string, requestId: string): Promise<RawKgPayloa
       `[${new Date().toISOString()}] ${requestId} ollama <- status=${response.status} elapsedMs=${Date.now() - startedAt} responseChars=${body.response.length} preview=${preview(body.response)}`
     );
 
-    return await parseOllamaJson(body.response, requestId);
+    return await parseModelJson(body.response, "ollama", requestId);
   } catch (error) {
     if (error instanceof DOMException && error.name === "AbortError") {
       throw new Error(`Ollama request timed out after ${timeoutMs / 1000} seconds.`);
@@ -265,7 +294,82 @@ async function askOllama(prompt: string, requestId: string): Promise<RawKgPayloa
   }
 }
 
-async function parseOllamaJson(responseText: string, requestId: string): Promise<RawKgPayload> {
+async function askAzureOpenAi(prompt: string, requestId: string): Promise<RawKgPayload> {
+  const missing = [
+    ["OPENAI_AZURE_API_KEY", azureOpenAiApiKey],
+    ["OPENAI_AZURE_API_ENDPOINT", azureOpenAiEndpoint]
+  ]
+    .filter(([, value]) => !value)
+    .map(([key]) => key);
+
+  if (missing.length) {
+    throw new Error(`Missing required environment variable(s): ${missing.join(", ")}`);
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  const startedAt = Date.now();
+  const endpoint = `${azureOpenAiEndpoint!.replace(/\/+$/, "")}/openai/deployments/${encodeURIComponent(
+    azureOpenAiDeployment
+  )}/chat/completions?api-version=${encodeURIComponent(azureOpenAiApiVersion)}`;
+
+  console.log(
+    `[${new Date().toISOString()}] ${requestId} azure-openai -> deployment=${azureOpenAiDeployment} endpoint=${azureOpenAiEndpoint} promptChars=${prompt.length} timeoutMs=${timeoutMs}`
+  );
+
+  try {
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "api-key": azureOpenAiApiKey!
+      },
+      body: JSON.stringify({
+        messages: [
+          {
+            role: "system",
+            content:
+              "You are Text2KG. Return only a valid JSON object that matches the requested knowledge graph schema."
+          },
+          { role: "user", content: prompt }
+        ],
+        response_format: { type: "json_object" },
+        max_completion_tokens: 4096
+      }),
+      signal: controller.signal
+    });
+
+    if (!response.ok) {
+      throw new Error(`Azure OpenAI returned ${response.status}: ${await response.text()}`);
+    }
+
+    const body = (await response.json()) as {
+      choices?: Array<{ message?: { content?: string } }>;
+    };
+    const content = body.choices?.[0]?.message?.content;
+    if (!content) {
+      throw new Error("Azure OpenAI returned an empty response.");
+    }
+
+    console.log(
+      `[${new Date().toISOString()}] ${requestId} azure-openai <- status=${response.status} elapsedMs=${Date.now() - startedAt} responseChars=${content.length} preview=${preview(content)}`
+    );
+
+    return await parseModelJson(content, "azure-openai", requestId);
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") {
+      throw new Error(`Azure OpenAI request timed out after ${timeoutMs / 1000} seconds.`);
+    }
+    if (error instanceof SyntaxError) {
+      throw new Error(`Azure OpenAI returned invalid JSON: ${error.message}`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function parseModelJson(responseText: string, provider: ModelProvider, requestId: string): Promise<RawKgPayload> {
   const attempts = buildJsonParseAttempts(responseText);
   const errors: string[] = [];
 
@@ -277,7 +381,7 @@ async function parseOllamaJson(responseText: string, requestId: string): Promise
     }
   }
 
-  const repaired = await repairJsonWithOllama(responseText, requestId);
+  const repaired = await repairJsonWithModel(responseText, provider, requestId);
   for (const candidate of buildJsonParseAttempts(repaired)) {
     try {
       return JSON.parse(candidate) as RawKgPayload;
@@ -289,7 +393,7 @@ async function parseOllamaJson(responseText: string, requestId: string): Promise
   console.error(
     `[${new Date().toISOString()}] ${requestId} json parse failed attempts=${errors.slice(0, 4).join(" | ")} responsePreview=${preview(responseText)}`
   );
-  throw new SyntaxError("The local model produced malformed JSON even after repair.");
+  throw new SyntaxError(`${providerLabel(provider)} produced malformed JSON even after repair.`);
 }
 
 function buildJsonParseAttempts(responseText: string): string[] {
@@ -302,7 +406,11 @@ function buildJsonParseAttempts(responseText: string): string[] {
   return Array.from(new Set([trimmed, withoutFence, extracted, withoutTrailingCommas, withEscapedControls]));
 }
 
-async function repairJsonWithOllama(responseText: string, requestId: string): Promise<string> {
+async function repairJsonWithModel(responseText: string, provider: ModelProvider, requestId: string): Promise<string> {
+  if (provider === "azure-openai") {
+    return repairJsonWithAzureOpenAi(responseText, requestId);
+  }
+
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), Math.min(timeoutMs, 60000));
 
@@ -337,6 +445,65 @@ async function repairJsonWithOllama(responseText: string, requestId: string): Pr
     const repaired = body.response ?? "";
     console.log(
       `[${new Date().toISOString()}] ${requestId} ollama repair <- responseChars=${repaired.length} preview=${preview(repaired)}`
+    );
+    return repaired;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function repairJsonWithAzureOpenAi(responseText: string, requestId: string): Promise<string> {
+  if (!azureOpenAiApiKey || !azureOpenAiEndpoint) {
+    throw new Error("Azure OpenAI JSON repair is unavailable because Azure credentials are missing.");
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), Math.min(timeoutMs, 60000));
+  const endpoint = `${azureOpenAiEndpoint.replace(/\/+$/, "")}/openai/deployments/${encodeURIComponent(
+    azureOpenAiDeployment
+  )}/chat/completions?api-version=${encodeURIComponent(azureOpenAiApiVersion)}`;
+
+  console.log(
+    `[${new Date().toISOString()}] ${requestId} azure-openai repair -> malformedChars=${responseText.length}`
+  );
+
+  try {
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "api-key": azureOpenAiApiKey
+      },
+      body: JSON.stringify({
+        messages: [
+          {
+            role: "system",
+            content: "Repair malformed JSON. Return valid JSON only, with no markdown or explanation."
+          },
+          {
+            role: "user",
+            content: [
+              "Repair the following malformed JSON into valid JSON only.",
+              "Keep the same data and the same top-level keys.",
+              "If a field is incomplete, use an empty string, empty object, empty array, or 0.5 confidence.",
+              responseText
+            ].join("\n\n")
+          }
+        ],
+        response_format: { type: "json_object" },
+        max_completion_tokens: 4096
+      }),
+      signal: controller.signal
+    });
+
+    if (!response.ok) {
+      throw new Error(`Azure OpenAI repair returned ${response.status}: ${await response.text()}`);
+    }
+
+    const body = (await response.json()) as { choices?: Array<{ message?: { content?: string } }> };
+    const repaired = body.choices?.[0]?.message?.content ?? "";
+    console.log(
+      `[${new Date().toISOString()}] ${requestId} azure-openai repair <- responseChars=${repaired.length} preview=${preview(repaired)}`
     );
     return repaired;
   } finally {
@@ -773,6 +940,14 @@ function normalizeGeneralizationLevel(value: unknown): GeneralizationLevel {
   return value === "low" || value === "medium" || value === "high" ? value : "medium";
 }
 
+function normalizeModelProvider(value: unknown): ModelProvider {
+  return value === "azure-openai" ? "azure-openai" : "ollama";
+}
+
+function providerLabel(provider: ModelProvider): string {
+  return provider === "azure-openai" ? "Azure OpenAI" : "Ollama";
+}
+
 function normalizeStatus(value: unknown, confidence: number, hasEvidence: boolean): ReviewStatus {
   const allowed: ReviewStatus[] = ["pending", "approved", "rejected", "edited", "needs_review"];
   if (!hasEvidence || confidence < 0.55) {
@@ -859,18 +1034,49 @@ function getRequestId(res: express.Response): string {
   return typeof res.locals.requestId === "string" ? res.locals.requestId : "req-unknown";
 }
 
+function loadDotEnv() {
+  for (const envPath of [path.resolve(process.cwd(), ".env"), path.resolve(process.cwd(), "..", ".env")]) {
+    if (!existsSync(envPath)) {
+      continue;
+    }
+
+    const lines = readFileSync(envPath, "utf8").split(/\r?\n/);
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith("#")) {
+        continue;
+      }
+
+      const separator = trimmed.indexOf("=");
+      if (separator <= 0) {
+        continue;
+      }
+
+      const key = trimmed.slice(0, separator).trim();
+      const rawValue = trimmed.slice(separator + 1).trim();
+      const value = rawValue.replace(/^(['"])(.*)\1$/, "$2");
+      if (key && process.env[key] === undefined) {
+        process.env[key] = value;
+      }
+    }
+  }
+}
+
 function formatBodySummary(body: unknown): string {
   if (!body || typeof body !== "object") {
     return "";
   }
 
-  const value = body as { text?: string; generalizationLevel?: string; kg?: KgPayload };
+  const value = body as { text?: string; generalizationLevel?: string; modelProvider?: string; kg?: KgPayload };
   const parts: string[] = [];
   if (typeof value.text === "string") {
     parts.push(`textChars=${value.text.length}`);
   }
   if (typeof value.generalizationLevel === "string") {
     parts.push(`generalization=${value.generalizationLevel}`);
+  }
+  if (typeof value.modelProvider === "string") {
+    parts.push(`provider=${value.modelProvider}`);
   }
   if (value.kg) {
     parts.push(`kg=${value.kg.triples?.length ?? 0}t`);
