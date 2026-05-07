@@ -530,8 +530,14 @@ blockquote {
   justify-content: space-between;
 }
 
+.schema-editor,
 .schema-list {
   display: grid;
+  gap: 8px;
+}
+
+.schema-toolbar {
+  display: flex;
   gap: 8px;
 }
 

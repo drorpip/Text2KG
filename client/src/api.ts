@@ -1,4 +1,4 @@
-import type { GeneralizationLevel, KgResult, ModelProvider } from "./types";
+import type { GeneralizationLevel, KgResult, ModelProvider, SchemaSuggestion } from "./types";
 
 export type ApiLogEntry = {
   id: string;
@@ -13,15 +13,26 @@ export async function analyzeText(
   text: string,
   generalizationLevel: GeneralizationLevel,
   modelProvider: ModelProvider,
+  schemaGuidance: SchemaSuggestion[],
   log?: LogSink
 ): Promise<KgResult> {
   const startedAt = performance.now();
-  log?.(makeLog("info", `POST /api/kg/analyze started (${text.length} chars, ${generalizationLevel}, ${modelProvider})`));
+  log?.(
+    makeLog(
+      "info",
+      `POST /api/kg/analyze started (${text.length} chars, ${generalizationLevel}, ${modelProvider}, ${schemaGuidance.length} schema rows)`
+    )
+  );
 
   const response = await fetch("/api/kg/analyze", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ text, generalizationLevel, modelProvider })
+    body: JSON.stringify({
+      text,
+      generalizationLevel,
+      modelProvider,
+      ...(schemaGuidance.length ? { schemaGuidance } : {})
+    })
   });
 
   const payload = await response.json();

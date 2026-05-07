@@ -1,9 +1,10 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Check,
   Download,
   FileText,
   Pencil,
+  Plus,
   RefreshCcw,
   TableProperties,
   Trash2,
@@ -13,7 +14,7 @@ import {
 import { ApiLogEntry, analyzeText, exportGraphMl, makeLog } from "./api";
 import { GraphEditor, type GraphLayout } from "./GraphEditor";
 import { confidenceLabel, emptyKgResult, filenameFromText, reviewedTriples, statusLabel } from "./graph";
-import type { GeneralizationLevel, KgResult, KgTriple, ModelProvider, ReviewStatus } from "./types";
+import type { GeneralizationLevel, KgNode, KgResult, KgTriple, ModelProvider, ReviewStatus, SchemaSuggestion } from "./types";
 
 const storageKey = "text2kg-state-v1";
 
@@ -34,12 +35,14 @@ export function App() {
   const [modelProvider, setModelProvider] = useState<ModelProvider>(initialState.modelProvider);
   const [graphLayout, setGraphLayout] = useState<GraphLayout>(initialState.graphLayout);
   const [kg, setKg] = useState<KgResult>(initialState.kg);
+  const kgRef = useRef(initialState.kg);
   const [activeView, setActiveView] = useState<ActiveView>("triples");
   const [editingTripleId, setEditingTripleId] = useState<string | null>(null);
   const [status, setStatus] = useState("Ready");
   const [error, setError] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [approvedOnlyExport, setApprovedOnlyExport] = useState(false);
+  const workspaceVersionRef = useRef(0);
   const [logs, setLogs] = useState<ApiLogEntry[]>(() => [
     makeLog("info", "Text2KG diagnostics ready. Backend logs are printed in the dev terminal.")
   ]);
@@ -48,7 +51,16 @@ export function App() {
     setLogs((items) => [entry, ...items].slice(0, 80));
   }
 
+  function updateKg(next: KgResult | ((current: KgResult) => KgResult)) {
+    setKg((current) => {
+      const resolved = typeof next === "function" ? next(current) : next;
+      kgRef.current = resolved;
+      return resolved;
+    });
+  }
+
   useEffect(() => {
+    kgRef.current = kg;
     localStorage.setItem(storageKey, JSON.stringify({ sourceText, generalizationLevel, modelProvider, graphLayout, kg }));
   }, [sourceText, generalizationLevel, modelProvider, graphLayout, kg]);
 
@@ -65,18 +77,32 @@ export function App() {
   }, [kg]);
 
   async function requestAnalysis() {
+    const requestWorkspaceVersion = workspaceVersionRef.current;
+    const schemaGuidance = kg.schema.filter((schema) => schema.status !== "rejected");
     setIsLoading(true);
     setError("");
     setStatus(`Analyzing text with ${modelProviderLabel(modelProvider)}...`);
-    addLog(makeLog("info", `Analyze clicked with ${sourceText.length} source chars using ${modelProviderLabel(modelProvider)}.`));
+    addLog(
+      makeLog(
+        "info",
+        `Analyze clicked with ${sourceText.length} source chars using ${modelProviderLabel(modelProvider)} and ${schemaGuidance.length} schema rows.`
+      )
+    );
 
     try {
-      const result = await analyzeText(sourceText, generalizationLevel, modelProvider, addLog);
-      setKg(result);
-      setGraphLayout({});
+      const result = await analyzeText(sourceText, generalizationLevel, modelProvider, schemaGuidance, addLog);
+      if (workspaceVersionRef.current !== requestWorkspaceVersion) {
+        setStatus("Ignored analysis result because the workspace was reset.");
+        addLog(makeLog("info", "Ignored stale analysis result after reset."));
+        return;
+      }
+      const merge = mergeKgResults(kgRef.current, result);
+      updateKg(merge.kg);
       setActiveView("triples");
       setEditingTripleId(null);
-      setStatus(`Detected ${result.triples.length} suggested triples from ${result.nodes.length} possible nodes.`);
+      setStatus(
+        `Appended ${merge.added.triples} triples, ${merge.added.nodes} nodes, ${merge.added.edges} relationships, and ${merge.added.schema} schema rows.`
+      );
     } catch (caught) {
       const message = caught instanceof Error ? caught.message : "Analysis failed.";
       setError(message);
@@ -88,7 +114,7 @@ export function App() {
   }
 
   function updateTriple(id: string, patch: Partial<KgTriple>) {
-    setKg((current) => ({
+    updateKg((current) => ({
       ...current,
       triples: current.triples.map((triple) =>
         triple.id === id ? { ...triple, ...patch, status: patch.status ?? "edited" } : triple
@@ -97,26 +123,84 @@ export function App() {
   }
 
   function setTripleStatus(id: string, nextStatus: ReviewStatus) {
-    setKg((current) => ({
+    updateKg((current) => ({
       ...current,
       triples: current.triples.map((triple) => (triple.id === id ? { ...triple, status: nextStatus } : triple))
     }));
   }
 
   function deleteTriple(id: string) {
-    setKg((current) => ({
+    updateKg((current) => ({
       ...current,
       triples: current.triples.map((triple) => (triple.id === id ? { ...triple, status: "rejected" } : triple))
     }));
     setEditingTripleId(null);
   }
 
+  function addSchema() {
+    updateKg((current) => {
+      const nextIndex = current.schema.length + 1;
+      return {
+        ...current,
+        schema: [
+          ...current.schema,
+          {
+            id: uniqueSchemaId(`schema_entity_related_to_entity_${nextIndex}`, current.schema),
+            subject_type: "Entity",
+            predicate: "related_to",
+            object_type: "Entity",
+            confidence: 0.5,
+            evidence: "",
+            status: "edited"
+          }
+        ]
+      };
+    });
+    setStatus("Added schema pattern.");
+  }
+
+  function updateSchema(id: string, patch: Partial<SchemaSuggestion>) {
+    updateKg((current) => ({
+      ...current,
+      schema: current.schema.map((schema) =>
+        schema.id === id
+          ? {
+              ...schema,
+              ...patch,
+              confidence: patch.confidence === undefined ? schema.confidence : clampConfidence(patch.confidence),
+              status: patch.status ?? "edited"
+            }
+          : schema
+      )
+    }));
+  }
+
+  function setSchemaStatus(id: string, nextStatus: ReviewStatus) {
+    updateKg((current) => ({
+      ...current,
+      schema: current.schema.map((schema) => (schema.id === id ? { ...schema, status: nextStatus } : schema))
+    }));
+  }
+
+  function deleteSchema(id: string) {
+    updateKg((current) => ({
+      ...current,
+      schema: current.schema.filter((schema) => schema.id !== id)
+    }));
+    setStatus("Deleted schema pattern.");
+  }
+
   function resetWorkspace() {
+    workspaceVersionRef.current += 1;
     setSourceText("");
     setGeneralizationLevel("medium");
     setModelProvider("ollama");
     setGraphLayout({});
-    setKg(emptyKgResult);
+    updateKg(emptyKgResult);
+    localStorage.setItem(
+      storageKey,
+      JSON.stringify({ sourceText: "", generalizationLevel: "medium", modelProvider: "ollama", graphLayout: {}, kg: emptyKgResult })
+    );
     setEditingTripleId(null);
     setError("");
     setStatus("Ready");
@@ -236,9 +320,9 @@ export function App() {
                 kg={kg}
                 layout={graphLayout}
                 onLayoutChange={setGraphLayout}
-                onKgChange={setKg}
+                onKgChange={updateKg}
                 onImport={(importedKg) => {
-                  setKg(importedKg);
+                  updateKg(importedKg);
                   setGraphLayout({});
                   setActiveView("graph");
                   addLog(makeLog("info", `Imported GraphML (${importedKg.nodes.length} nodes, ${importedKg.edges.length} edges).`));
@@ -261,7 +345,15 @@ export function App() {
             ) : null}
             {activeView === "nodes" ? <NodesList kg={kg} /> : null}
             {activeView === "edges" ? <EdgesList kg={kg} /> : null}
-            {activeView === "schema" ? <SchemaView kg={kg} /> : null}
+            {activeView === "schema" ? (
+              <SchemaView
+                schema={kg.schema}
+                onAdd={addSchema}
+                onUpdate={updateSchema}
+                onStatus={setSchemaStatus}
+                onDelete={deleteSchema}
+              />
+            ) : null}
           </div>
         </section>
 
@@ -506,21 +598,107 @@ function EdgesList({ kg }: { kg: KgResult }) {
   );
 }
 
-function SchemaView({ kg }: { kg: KgResult }) {
-  if (kg.schema.length === 0) {
-    return <EmptyState title="No schema suggestions yet" body="Use medium or high generalization to request reusable KG patterns." />;
-  }
-
+function SchemaView({
+  schema,
+  onAdd,
+  onUpdate,
+  onStatus,
+  onDelete
+}: {
+  schema: SchemaSuggestion[];
+  onAdd: () => void;
+  onUpdate: (id: string, patch: Partial<SchemaSuggestion>) => void;
+  onStatus: (id: string, status: ReviewStatus) => void;
+  onDelete: (id: string) => void;
+}) {
   return (
-    <div className="schema-list">
-      {kg.schema.map((schema) => (
-        <article className="schema-row" key={schema.id}>
-          <span>{schema.subject_type}</span>
-          <strong>{schema.predicate}</strong>
-          <span>{schema.object_type}</span>
-          <em>{schema.confidence.toFixed(2)}</em>
-        </article>
-      ))}
+    <div className="schema-editor">
+      <div className="schema-toolbar">
+        <button type="button" className="secondary-button compact" onClick={onAdd}>
+          <Plus size={15} />
+          Schema pattern
+        </button>
+      </div>
+      {schema.length === 0 ? (
+        <EmptyState title="No schema patterns yet" body="Add optional reusable KG patterns before analyzing text." />
+      ) : (
+        <div className="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Subject type</th>
+                <th>Predicate</th>
+                <th>Object type</th>
+                <th>Confidence</th>
+                <th>Evidence</th>
+                <th>Status</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {schema.map((item) => (
+                <tr key={item.id} className={`status-${item.status}`}>
+                  <td>
+                    <input
+                      value={item.subject_type}
+                      aria-label="Subject type"
+                      onChange={(event) => onUpdate(item.id, { subject_type: event.target.value })}
+                    />
+                  </td>
+                  <td>
+                    <input
+                      value={item.predicate}
+                      aria-label="Predicate"
+                      onChange={(event) => onUpdate(item.id, { predicate: event.target.value })}
+                    />
+                  </td>
+                  <td>
+                    <input
+                      value={item.object_type}
+                      aria-label="Object type"
+                      onChange={(event) => onUpdate(item.id, { object_type: event.target.value })}
+                    />
+                  </td>
+                  <td>
+                    <input
+                      type="number"
+                      min="0"
+                      max="1"
+                      step="0.01"
+                      value={item.confidence}
+                      aria-label="Confidence"
+                      onChange={(event) => onUpdate(item.id, { confidence: event.target.valueAsNumber })}
+                    />
+                  </td>
+                  <td>
+                    <input
+                      value={item.evidence}
+                      aria-label="Evidence"
+                      onChange={(event) => onUpdate(item.id, { evidence: event.target.value })}
+                    />
+                  </td>
+                  <td>
+                    <span className={`status-pill ${item.status}`}>{statusLabel(item.status)}</span>
+                  </td>
+                  <td>
+                    <div className="action-row">
+                      <button type="button" className="icon-button approve" onClick={() => onStatus(item.id, "approved")} title="Approve">
+                        <Check size={16} />
+                      </button>
+                      <button type="button" className="icon-button reject" onClick={() => onStatus(item.id, "rejected")} title="Reject">
+                        <X size={16} />
+                      </button>
+                      <button type="button" className="icon-button reject" onClick={() => onDelete(item.id)} title="Delete schema pattern">
+                        <Trash2 size={16} />
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
     </div>
   );
 }
@@ -547,6 +725,133 @@ function confidenceClass(confidence: number): string {
 
 function modelProviderLabel(provider: ModelProvider): string {
   return provider === "azure-openai" ? "Azure OpenAI GPT-5.2" : "local Ollama Gemma";
+}
+
+function mergeKgResults(current: KgResult, incoming: KgResult): { kg: KgResult; added: { nodes: number; edges: number; triples: number; schema: number } } {
+  const nodes = [...current.nodes];
+  const nodeIdByIncomingId = new Map<string, string>();
+  const nodeKeyToId = new Map(nodes.map((node) => [normalizeKey(node.name), node.id]));
+  let addedNodes = 0;
+
+  for (const node of incoming.nodes) {
+    const key = normalizeKey(node.name);
+    const existingId = nodeKeyToId.get(key);
+    if (existingId) {
+      nodeIdByIncomingId.set(node.id, existingId);
+      continue;
+    }
+
+    const id = uniqueNodeId(node.id, nodes);
+    nodes.push({ ...node, id });
+    nodeKeyToId.set(key, id);
+    nodeIdByIncomingId.set(node.id, id);
+    addedNodes += 1;
+  }
+
+  const triples = [...current.triples];
+  const tripleKeys = new Set(triples.map((triple) => tripleKey(triple.subject, triple.predicate, triple.object)));
+  let addedTriples = 0;
+  for (const triple of incoming.triples) {
+    const key = tripleKey(triple.subject, triple.predicate, triple.object);
+    if (tripleKeys.has(key)) {
+      continue;
+    }
+    triples.push({ ...triple, id: uniqueItemId(triple.id, triples) });
+    tripleKeys.add(key);
+    addedTriples += 1;
+  }
+
+  const edges = [...current.edges];
+  const edgeKeys = new Set(edges.map((edge) => edgeKey(edge.source, edge.label, edge.target)));
+  let addedEdges = 0;
+  for (const edge of incoming.edges) {
+    const source = nodeIdByIncomingId.get(edge.source) ?? edge.source;
+    const target = nodeIdByIncomingId.get(edge.target) ?? edge.target;
+    const key = edgeKey(source, edge.label, target);
+    if (edgeKeys.has(key)) {
+      continue;
+    }
+    edges.push({ ...edge, id: uniqueItemId(edge.id, edges), source, target });
+    edgeKeys.add(key);
+    addedEdges += 1;
+  }
+
+  const schema = [...current.schema];
+  const schemaKeys = new Set(schema.map((item) => schemaKey(item.subject_type, item.predicate, item.object_type)));
+  let addedSchema = 0;
+  for (const item of incoming.schema) {
+    const key = schemaKey(item.subject_type, item.predicate, item.object_type);
+    if (schemaKeys.has(key)) {
+      continue;
+    }
+    schema.push({ ...item, id: uniqueSchemaId(item.id, schema) });
+    schemaKeys.add(key);
+    addedSchema += 1;
+  }
+
+  return {
+    kg: {
+      nodes,
+      edges,
+      triples,
+      schema,
+      notes: incoming.notes || current.notes,
+      generalizationLevel: incoming.generalizationLevel
+    },
+    added: { nodes: addedNodes, edges: addedEdges, triples: addedTriples, schema: addedSchema }
+  };
+}
+
+function tripleKey(subject: string, predicate: string, object: string): string {
+  return `${normalizeKey(subject)}|${normalizeKey(predicate)}|${normalizeKey(object)}`;
+}
+
+function edgeKey(source: string, label: string, target: string): string {
+  return `${source}|${normalizeKey(label)}|${target}`;
+}
+
+function schemaKey(subjectType: string, predicate: string, objectType: string): string {
+  return `${normalizeKey(subjectType)}|${normalizeKey(predicate)}|${normalizeKey(objectType)}`;
+}
+
+function normalizeKey(value: string): string {
+  return value.trim().toLowerCase();
+}
+
+function clampConfidence(value: number): number {
+  return Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : 0.5;
+}
+
+function stableId(value: string): string {
+  return (
+    value
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "_")
+      .replace(/^_+|_+$/g, "")
+      .slice(0, 96) || "item"
+  );
+}
+
+function uniqueNodeId(baseId: string, nodes: KgNode[]): string {
+  return uniqueId(stableId(baseId), new Set(nodes.map((node) => node.id)));
+}
+
+function uniqueSchemaId(baseId: string, schema: SchemaSuggestion[]): string {
+  return uniqueId(stableId(baseId), new Set(schema.map((item) => item.id)));
+}
+
+function uniqueItemId<T extends { id: string }>(baseId: string, items: T[]): string {
+  return uniqueId(stableId(baseId), new Set(items.map((item) => item.id)));
+}
+
+function uniqueId(baseId: string, used: Set<string>): string {
+  let candidate = baseId || "item";
+  let index = 2;
+  while (used.has(candidate)) {
+    candidate = `${baseId}_${index}`;
+    index += 1;
+  }
+  return candidate;
 }
 
 function loadState(): SavedState {

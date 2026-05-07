@@ -118,14 +118,16 @@ app.get("/api/health", (_req, res) => {
 
 app.post("/api/kg/analyze", async (req, res) => {
   try {
-    const { text, generalizationLevel, modelProvider } = req.body as {
+    const { text, generalizationLevel, modelProvider, schemaGuidance } = req.body as {
       text?: string;
       generalizationLevel?: GeneralizationLevel;
       modelProvider?: ModelProvider;
+      schemaGuidance?: unknown[];
     };
     const sourceText = typeof text === "string" ? text.trim() : "";
     const level = normalizeGeneralizationLevel(generalizationLevel);
     const provider = normalizeModelProvider(modelProvider);
+    const guidance = normalizeSchemaGuidance(schemaGuidance);
     const requestId = getRequestId(res);
 
     if (!sourceText) {
@@ -138,10 +140,10 @@ app.post("/api/kg/analyze", async (req, res) => {
     }
 
     console.log(
-      `[${new Date().toISOString()}] ${requestId} analyze textChars=${sourceText.length} generalization=${level} provider=${provider}`
+      `[${new Date().toISOString()}] ${requestId} analyze textChars=${sourceText.length} generalization=${level} provider=${provider} schemaGuidance=${guidance.length}`
     );
 
-    const raw = await askModel(buildKgPrompt(sourceText, level), provider, requestId);
+    const raw = await askModel(buildKgPrompt(sourceText, level, guidance), provider, requestId);
     const payload = normalizeKgPayload(raw, sourceText, level);
     console.log(
       `[${new Date().toISOString()}] ${requestId} analyze result triples=${payload.triples.length} nodes=${payload.nodes.length} edges=${payload.edges.length} schema=${payload.schema.length}`
@@ -172,8 +174,8 @@ app.listen(port, "127.0.0.1", () => {
   console.log(`Text2KG API listening on http://127.0.0.1:${port}`);
 });
 
-function buildKgPrompt(text: string, level: GeneralizationLevel): string {
-  return [
+function buildKgPrompt(text: string, level: GeneralizationLevel, schemaGuidance: SchemaSuggestion[]): string {
+  const promptParts = [
     "You are Text2KG, a knowledge graph understanding assistant.",
     "Your job is to suggest an initial Knowledge Graph from English text. Treat every output as a suggestion for human review, not a final truth.",
     "Prioritize precision over recall. Suggest fewer high-quality triples rather than many weak relationships.",
@@ -181,9 +183,31 @@ function buildKgPrompt(text: string, level: GeneralizationLevel): string {
     "Every triple must have a short evidence span copied exactly from the source text. Keep evidence under 180 characters. If a relationship is only implied, lower confidence and mark it needs_review.",
     "Do not include markdown, comments, ellipses, explanations, or text outside the JSON object.",
     `Generalization level: ${level}. Low means specific instance facts. Medium means include useful entity types. High means include schema suggestions without becoming generic like Thing -> relatedTo -> Thing.`,
-    kgJsonContract(),
-    `Source text:\n${text}`
-  ].join("\n\n");
+    kgJsonContract()
+  ];
+
+  if (schemaGuidance.length) {
+    promptParts.push(
+      [
+        "Optional user-defined schema guidance:",
+        "Prioritize extracting triples that fit these reusable patterns when the source text supports them.",
+        "Do not invent facts just to satisfy a pattern. You may still include other high-confidence triples from the source.",
+        JSON.stringify(
+          schemaGuidance.map((item) => ({
+            subject_type: item.subject_type,
+            predicate: item.predicate,
+            object_type: item.object_type,
+            status: item.status
+          })),
+          null,
+          2
+        )
+      ].join("\n")
+    );
+  }
+
+  promptParts.push(`Source text:\n${text}`);
+  return promptParts.join("\n\n");
 }
 
 function kgJsonContract(): string {
@@ -763,6 +787,43 @@ function normalizeSchema(value: unknown, sourceText: string, index: number): Sch
   };
 }
 
+function normalizeSchemaGuidance(value: unknown): SchemaSuggestion[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return dedupeSchema(value.map((item, index) => normalizeSchemaGuidanceItem(item, index)).filter(isTruthy));
+}
+
+function normalizeSchemaGuidanceItem(value: unknown, index: number): SchemaSuggestion | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const raw = value as Partial<SchemaSuggestion>;
+  const subjectType = cleanString(raw.subject_type);
+  const predicate = cleanPredicate(raw.predicate);
+  const objectType = cleanString(raw.object_type);
+  if (!subjectType || !predicate || !objectType) {
+    return null;
+  }
+
+  const status = normalizeGuidanceStatus(raw.status);
+  if (status === "rejected") {
+    return null;
+  }
+
+  return {
+    id: stableId(raw.id ?? `schema-guidance-${index + 1}-${subjectType}-${predicate}-${objectType}`),
+    subject_type: subjectType,
+    predicate,
+    object_type: objectType,
+    confidence: clampConfidence(raw.confidence),
+    evidence: cleanString(raw.evidence),
+    status
+  };
+}
+
 function ensureNode(
   nodes: Map<string, KgNode>,
   name: string,
@@ -956,6 +1017,11 @@ function normalizeStatus(value: unknown, confidence: number, hasEvidence: boolea
   return allowed.includes(value as ReviewStatus) ? (value as ReviewStatus) : "pending";
 }
 
+function normalizeGuidanceStatus(value: unknown): ReviewStatus {
+  const allowed: ReviewStatus[] = ["pending", "approved", "rejected", "edited", "needs_review"];
+  return allowed.includes(value as ReviewStatus) ? (value as ReviewStatus) : "edited";
+}
+
 function normalizeEvidenceArray(value: unknown): string[] {
   if (Array.isArray(value)) {
     return value.map(cleanString).filter(Boolean);
@@ -1067,7 +1133,13 @@ function formatBodySummary(body: unknown): string {
     return "";
   }
 
-  const value = body as { text?: string; generalizationLevel?: string; modelProvider?: string; kg?: KgPayload };
+  const value = body as {
+    text?: string;
+    generalizationLevel?: string;
+    modelProvider?: string;
+    schemaGuidance?: unknown[];
+    kg?: KgPayload;
+  };
   const parts: string[] = [];
   if (typeof value.text === "string") {
     parts.push(`textChars=${value.text.length}`);
@@ -1077,6 +1149,9 @@ function formatBodySummary(body: unknown): string {
   }
   if (typeof value.modelProvider === "string") {
     parts.push(`provider=${value.modelProvider}`);
+  }
+  if (Array.isArray(value.schemaGuidance)) {
+    parts.push(`schemaGuidance=${value.schemaGuidance.length}`);
   }
   if (value.kg) {
     parts.push(`kg=${value.kg.triples?.length ?? 0}t`);
