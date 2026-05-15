@@ -157,13 +157,13 @@ app.post("/api/kg/analyze", async (req, res) => {
 
 app.post("/api/kg/export/graphml", (req, res) => {
   try {
-    const { kg, approvedOnly } = req.body as { kg?: KgPayload; approvedOnly?: boolean };
+    const { kg, approvedOnly, sourceText } = req.body as { kg?: KgPayload; approvedOnly?: boolean; sourceText?: unknown };
     if (!kg || !Array.isArray(kg.triples)) {
       res.status(400).json({ error: "Reviewed KG data is required for GraphML export." });
       return;
     }
 
-    const graphml = buildGraphMl(kg, Boolean(approvedOnly));
+    const graphml = buildGraphMl(kg, Boolean(approvedOnly), typeof sourceText === "string" ? sourceText : "");
     res.type("application/graphml+xml").send(graphml);
   } catch (error) {
     res.status(400).json({ error: toErrorMessage(error) });
@@ -873,7 +873,7 @@ function edgeFromTriple(triple: KgTriple, nodeIdByName: Map<string, string>): Kg
   };
 }
 
-function buildGraphMl(kg: KgPayload, approvedOnly: boolean): string {
+function buildGraphMl(kg: KgPayload, approvedOnly: boolean, sourceText: string): string {
   const triples = kg.triples.filter((triple) => (approvedOnly ? triple.status === "approved" : triple.status !== "rejected"));
   const nodeByName = new Map<string, KgNode>();
   for (const node of kg.nodes) {
@@ -915,7 +915,9 @@ function buildGraphMl(kg: KgPayload, approvedOnly: boolean): string {
     '  <key id="status" for="all" attr.name="status" attr.type="string"/>',
     '  <key id="evidence" for="all" attr.name="evidence" attr.type="string"/>',
     '  <key id="predicate" for="edge" attr.name="predicate" attr.type="string"/>',
+    '  <key id="source_text" for="graph" attr.name="source_text" attr.type="string"/>',
     '  <graph id="Text2KG" edgedefault="directed">',
+    `    <data key="source_text">${xmlText(sourceText)}</data>`,
     ...nodes.map((node) =>
       [
         `    <node id="${xmlAttr(node.id)}">`,

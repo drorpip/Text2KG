@@ -53,14 +53,14 @@ export async function analyzeText(
   return payload;
 }
 
-export async function exportGraphMl(kg: KgResult, approvedOnly: boolean, log?: LogSink): Promise<string> {
+export async function exportGraphMl(kg: KgResult, approvedOnly: boolean, sourceText: string, log?: LogSink): Promise<string> {
   const startedAt = performance.now();
   log?.(makeLog("info", `POST /api/kg/export/graphml started (${approvedOnly ? "approved only" : "reviewed graph"})`));
 
   const response = await fetch("/api/kg/export/graphml", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ kg, approvedOnly })
+    body: JSON.stringify({ kg, approvedOnly, sourceText })
   });
 
   const elapsedMs = Math.round(performance.now() - startedAt);

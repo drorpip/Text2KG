@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Check,
   Download,
+  FileUp,
   FileText,
   Pencil,
   Plus,
@@ -14,6 +15,7 @@ import {
 import { ApiLogEntry, analyzeText, exportGraphMl, makeLog } from "./api";
 import { GraphEditor, type GraphLayout } from "./GraphEditor";
 import { confidenceLabel, emptyKgResult, filenameFromText, reviewedTriples, statusLabel } from "./graph";
+import { parseGraphMlToKg } from "./graphml";
 import type { GeneralizationLevel, KgNode, KgResult, KgTriple, ModelProvider, ReviewStatus, SchemaSuggestion } from "./types";
 
 const storageKey = "text2kg-state-v1";
@@ -43,6 +45,7 @@ export function App() {
   const [isLoading, setIsLoading] = useState(false);
   const [approvedOnlyExport, setApprovedOnlyExport] = useState(false);
   const workspaceVersionRef = useRef(0);
+  const graphMlInputRef = useRef<HTMLInputElement | null>(null);
   const [logs, setLogs] = useState<ApiLogEntry[]>(() => [
     makeLog("info", "Text2KG diagnostics ready. Backend logs are printed in the dev terminal.")
   ]);
@@ -211,7 +214,7 @@ export function App() {
     setIsLoading(true);
     setError("");
     try {
-      const graphml = await exportGraphMl(kg, approvedOnlyExport, addLog);
+      const graphml = await exportGraphMl(kg, approvedOnlyExport, sourceText, addLog);
       const blob = new Blob([graphml], { type: "application/graphml+xml" });
       const url = URL.createObjectURL(blob);
       const link = document.createElement("a");
@@ -229,6 +232,44 @@ export function App() {
     }
   }
 
+  async function importGraphMl(file: File | undefined) {
+    if (!file) {
+      return;
+    }
+
+    try {
+      const parsed = parseGraphMlToKg(await file.text());
+      if (
+        (kg.nodes.length || kg.edges.length || kg.triples.length || sourceText.trim()) &&
+        !window.confirm("Replace the current graph and source text with this GraphML file?")
+      ) {
+        return;
+      }
+
+      updateKg(parsed.kg);
+      setGraphLayout({});
+      setSourceText(parsed.sourceText);
+      setActiveView("graph");
+      setEditingTripleId(null);
+      setError("");
+      setStatus(
+        `Imported GraphML with ${parsed.kg.nodes.length} nodes and ${parsed.kg.edges.length} edges${
+          parsed.sourceText ? ", including source text" : ""
+        }.`
+      );
+      addLog(makeLog("info", `Imported GraphML (${parsed.kg.nodes.length} nodes, ${parsed.kg.edges.length} edges).`));
+    } catch (caught) {
+      const message = caught instanceof Error ? caught.message : "GraphML import failed.";
+      setError(message);
+      setStatus(message);
+      addLog(makeLog("error", message));
+    } finally {
+      if (graphMlInputRef.current) {
+        graphMlInputRef.current.value = "";
+      }
+    }
+  }
+
   return (
     <div className="app-shell">
       <header className="top-bar">
@@ -241,6 +282,23 @@ export function App() {
             <RefreshCcw size={17} />
             Reset
           </button>
+          <button
+            type="button"
+            className="secondary-button"
+            onClick={() => graphMlInputRef.current?.click()}
+            disabled={isLoading}
+            title="Import GraphML"
+          >
+            <FileUp size={17} />
+            Import GraphML
+          </button>
+          <input
+            ref={graphMlInputRef}
+            className="hidden-file-input"
+            type="file"
+            accept=".graphml,.xml,application/xml,text/xml"
+            onChange={(event) => void importGraphMl(event.target.files?.[0])}
+          />
           <button type="button" onClick={downloadGraphMl} disabled={isLoading || stats.exportable === 0} title="Export GraphML">
             <Download size={17} />
             Export GraphML
@@ -321,12 +379,6 @@ export function App() {
                 layout={graphLayout}
                 onLayoutChange={setGraphLayout}
                 onKgChange={updateKg}
-                onImport={(importedKg) => {
-                  updateKg(importedKg);
-                  setGraphLayout({});
-                  setActiveView("graph");
-                  addLog(makeLog("info", `Imported GraphML (${importedKg.nodes.length} nodes, ${importedKg.edges.length} edges).`));
-                }}
                 onStatus={(message) => {
                   setStatus(message);
                   addLog(makeLog(message.toLowerCase().includes("failed") || message.toLowerCase().includes("invalid") ? "error" : "info", message));

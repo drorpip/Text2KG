@@ -2,7 +2,12 @@ import type { KgEdge, KgNode, KgResult, KgTriple, ReviewStatus } from "./types";
 
 const validStatuses: ReviewStatus[] = ["pending", "approved", "rejected", "edited", "needs_review"];
 
-export function parseGraphMlToKg(graphml: string): KgResult {
+export type ParsedGraphMl = {
+  kg: KgResult;
+  sourceText: string;
+};
+
+export function parseGraphMlToKg(graphml: string): ParsedGraphMl {
   const doc = new DOMParser().parseFromString(graphml, "application/xml");
   const parseError = doc.querySelector("parsererror");
   if (parseError) {
@@ -15,6 +20,7 @@ export function parseGraphMlToKg(graphml: string): KgResult {
   }
 
   const keyNames = keyNameMap(doc);
+  const sourceText = dataValue(graph, keyNames, ["source_text", "sourceText", "source text"]);
   const graphNodes = Array.from(graph.querySelectorAll(":scope > node"));
   const graphEdges = Array.from(graph.querySelectorAll(":scope > edge"));
   const idByGraphMlNodeId = new Map<string, string>();
@@ -85,12 +91,15 @@ export function parseGraphMlToKg(graphml: string): KgResult {
   }
 
   return {
-    nodes,
-    edges,
-    triples,
-    schema: [],
-    notes: "Imported from GraphML. Review generated triples before export.",
-    generalizationLevel: "medium"
+    kg: {
+      nodes,
+      edges,
+      triples,
+      schema: [],
+      notes: "Imported from GraphML. Review generated triples before export.",
+      generalizationLevel: "medium"
+    },
+    sourceText
   };
 }
 

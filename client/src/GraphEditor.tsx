@@ -13,8 +13,7 @@ import {
   type ReactFlowInstance
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { FileUp, Focus, Link, Plus, Trash2 } from "lucide-react";
-import { parseGraphMlToKg } from "./graphml";
+import { Focus, Link, Plus, Trash2 } from "lucide-react";
 import type { KgEdge, KgNode, KgResult, KgTriple } from "./types";
 
 export type GraphLayout = Record<string, { x: number; y: number }>;
@@ -29,14 +28,12 @@ type GraphEditorProps = {
   layout: GraphLayout;
   onLayoutChange: (layout: GraphLayout | ((current: GraphLayout) => GraphLayout)) => void;
   onKgChange: (kg: KgResult | ((current: KgResult) => KgResult)) => void;
-  onImport: (kg: KgResult) => void;
   onStatus: (message: string) => void;
 };
 
-export function GraphEditor({ kg, layout, onLayoutChange, onKgChange, onImport, onStatus }: GraphEditorProps) {
+export function GraphEditor({ kg, layout, onLayoutChange, onKgChange, onStatus }: GraphEditorProps) {
   const [selected, setSelected] = useState<SelectedGraphItem>(null);
   const flowRef = useRef<ReactFlowInstance | null>(null);
-  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const flowNodes = useMemo<Node[]>(() => kg.nodes.map((node, index) => kgNodeToFlowNode(node, layout, index)), [kg.nodes, layout]);
   const flowEdges = useMemo<Edge[]>(() => kg.edges.map(kgEdgeToFlowEdge), [kg.edges]);
@@ -164,27 +161,6 @@ export function GraphEditor({ kg, layout, onLayoutChange, onKgChange, onImport, 
     onKgChange((current) => relabelKgEdge(current, edgeId, nextLabel));
   }
 
-  async function importGraphMl(file: File | undefined) {
-    if (!file) {
-      return;
-    }
-    try {
-      const parsed = parseGraphMlToKg(await file.text());
-      if ((kg.nodes.length || kg.edges.length || kg.triples.length) && !window.confirm("Replace the current graph with this GraphML file?")) {
-        return;
-      }
-      onImport(parsed);
-      setSelected(null);
-      onStatus(`Imported GraphML with ${parsed.nodes.length} nodes and ${parsed.edges.length} edges.`);
-    } catch (error) {
-      onStatus(error instanceof Error ? error.message : "GraphML import failed.");
-    } finally {
-      if (fileInputRef.current) {
-        fileInputRef.current.value = "";
-      }
-    }
-  }
-
   return (
     <div className="graph-editor">
       <div className="graph-toolbar">
@@ -200,17 +176,6 @@ export function GraphEditor({ kg, layout, onLayoutChange, onKgChange, onImport, 
           <Focus size={15} />
           Fit
         </button>
-        <button type="button" className="secondary-button compact" onClick={() => fileInputRef.current?.click()}>
-          <FileUp size={15} />
-          Import GraphML
-        </button>
-        <input
-          ref={fileInputRef}
-          className="hidden-file-input"
-          type="file"
-          accept=".graphml,.xml,application/xml,text/xml"
-          onChange={(event) => void importGraphMl(event.target.files?.[0])}
-        />
       </div>
 
       <div className="graph-canvas">
